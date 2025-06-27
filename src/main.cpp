@@ -35,10 +35,31 @@ void modemOff();
 void networkAttach();
 String sendAT(const String& cmd, uint32_t to = 2000, bool dbg = DEBUG);
 void syncRTC();
-void postHTTPS(const char* url, const String& payload);
+bool postHTTPS(const char* url, const String& payload);
+void initSDCard();
+
 
 void setup() {
+    // DEBUG SERIAL PORT
+    SerialUSB.begin(BAUD);
+    while (!SerialUSB);
+    // Initialize Serial1 for 4G LTE modem communication
+    Serial1.begin(BAUD);
+    while (!Serial1);
+    // Initialize Serial2 for LoRa communication
+    Serial2.begin(BAUD);
+    while (!Serial2);
 
+    /* --- INITIALIZE RTC --- */
+    rtc.begin();
+    rtc.setTime(0, 0, 0);
+    rtc.setDate(1, 1, 2023); // Set initial date (1st Jan 2023)
+
+    /* --- INITIALIZE SD CARD --- */
+    initSDCard();
+
+    /* --- INITIALIZE STATE MACHINE --- */
+    state = 0;
 }
 
 void loop() {
@@ -124,9 +145,7 @@ void modemOff() {
     digitalWrite(LTE_PWRKEY_PIN, HIGH);
 }
 
-/* ================================================================ */
-/*  ATTACH to LTE NETWORK (T-Mobile)                                */
-/* ================================================================ */
+/* --- ATTACH TO LTE NETWORK --- */
 void networkAttach() {
 
     sendAT("AT+CFUN=1", 1000, false);                                           // full-func
@@ -158,9 +177,7 @@ void networkAttach() {
     }
 }
 
-/* ================================================================ */
-/*  Generic AT helper                                               */
-/* ================================================================ */
+/* --- SEND AT COMMAND to 4G LTE MODULE --- */
 String sendAT(const String& cmd,
               uint32_t      to  = 2000,
               bool          dbg = DEBUG)          // ▸ supply default for dbg
