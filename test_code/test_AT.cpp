@@ -23,6 +23,8 @@
 #define LTE_RESET_PIN 6
 #define LTE_FLIGHT_PIN 7
 
+const int PIN_SD_SELECT = 4;
+
 String from_usb = "";
 
 String sendData(String command, const int timeout, boolean debug);

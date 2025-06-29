@@ -29,15 +29,26 @@ uint8_t hoursInDay = 0; // Counter for hours in a day
 /* --- RTC OBJECT --- */
 RTCZero rtc;
 
+struct GNSS {
+    float latitude;
+    float longitude;
+    float altitude;
+};
+
+GNSS location;
+
 /* --- FUNCTION DECLARATION --- */
 void modemBoot();
 void modemOff();
 void networkAttach();
 String sendAT(const String& cmd, uint32_t to = 2000, bool dbg = DEBUG);
-void syncRTC();
+void syncSystem();
 bool postHTTPS(const char* url, const String& payload);
-void initSDCard();
-
+bool sdInit();
+bool sdHasCsvFiles();
+bool sdUploadChrono(bool (*up)(const String&));
+bool sdDeleteCsv(const char* name);
+bool postDataHttps(const String& payload);
 
 void setup() {
     // DEBUG SERIAL PORT
@@ -56,7 +67,19 @@ void setup() {
     rtc.setDate(1, 1, 2023); // Set initial date (1st Jan 2023)
 
     /* --- INITIALIZE SD CARD --- */
-    initSDCard();
+    if (!sdInit()) {
+        SerialUSB.println(F("SD CARD NOT READY!"));
+        SerialUSB.println(F("Please check the SD card connection."));
+        while (true) {
+            delay(1000);
+            SerialUSB.println(F("Waiting for SD card..."));
+        }
+    }
+
+    /* --- Initialize RTC --- */
+    rtc.begin();
+    rtc.setTime(0, 0, 0); // Set initial time to 00:00:00
+    rtc.setDate(1, 1, 2025); // Set initial date (1st Jan 2025)
 
     /* --- INITIALIZE STATE MACHINE --- */
     state = 0;
@@ -68,16 +91,25 @@ void loop() {
     switch (state) {
         /* --- LoRa Network Set-up --- */
         case 0:
-            /* --- Boot 4G LTE Modem --- */
+            /* --- Boot SIM7600 Modem --- */
+            modemBoot();
+            /* --- Sync System Time and Location --- */
+            syncSystem();
+            /* --- Turn Off 4G LTE Modem --- */
+            modemOff();
+            /* --- BOOT LoRa MODULE --- */
+            /* --- BEGIN LORA COMMUNICATION (Send Network Acknowledgment and RTC INFO) --- */
+            /* --- LISTEN FOR LORA RESPONSES and SAVE DATA --- */
+            /* --- SHUT DOWN LoRa MODULE --- */
+            /* --- BOOT SIM7600 MODEM --- */
             modemBoot();
             /* --- Attach to LTE Network --- */
             networkAttach();
-            /* --- Sync RTC with LTE Modem --- */
-            syncRTC();
-
-            /* --- BOOT LoRa MODULE --- */
-            /* --- SENDS TIME INFO EVER 5s TO SYNC SLAVE RTC FOR 5 MINS --- */
-            /* --- SHUT DOWN LoRa MODULE --- */
+            /* --- Upload Data via HTTPS --- */
+            if (sdHasCsvFiles()) {
+                SerialUSB.println(F("Uploading saved data..."));
+                if (sdUploadChrono())
+            }
             state = 1;
             break;
         /* --- GATEWAY --- */
@@ -116,6 +148,53 @@ void loop() {
             state = 0;
     }
 }
+/* --------------------------------------------------------------------------- 
+
+                         .-.
+                        ( (
+                         `-'
+
+
+
+
+
+
+                    .   ,- To the Moon !
+                   .'.
+                   |o|
+                  .'o'.
+                  |.-.|
+                  '   '
+                   ( )
+                    )
+                   ( )
+
+               ____
+          .-'""p 8o""`-.
+       .-'8888P'Y.`Y[ ' `-.
+     ,']88888b.J8oo_      '`.
+   ,' ,88888888888["        Y`.
+  /   8888888888P            Y8\
+ /    Y8888888P'             ]88\
+:     `Y88'   P              `888:
+:       Y8.oP '- >            Y88:
+|          `Yb  __             `'|
+:            `'d8888bo.          :
+:             d88888888ooo.      ;
+ \            Y88888888888P     /
+  \            `Y88888888P     /
+   `.            d88888P'    ,'
+     `.          888PP'    ,'
+       `-.      d8P'    ,-'   -- Ur Mom
+          `-.,,_'__,,.-'
+------------------------------------------------------------------------------
+|--- Non est ad astra mollis e terris via. ---|
+------------------------------------------------------------------------------ */
+/* ---------------------------------- */
+/* |================================| */
+/* |===== FUNCTION DEFINITIONS =====| */
+/* |================================| */
+/* ---------------------------------- */
 
 /* --- BOOT MODEM SEQUENCE --- */
 void modemBoot() {
@@ -161,7 +240,7 @@ void networkAttach() {
     delay(500);
     }
     if (!tries) {
-        SerialUSB.println(F("❌ CGATT FAIL"));
+        SerialUSB.println(F("CGATT FAIL"));
         return;
     }
 
@@ -172,7 +251,7 @@ void networkAttach() {
     SerialUSB.print(F("IP RESP: ")); 
     SerialUSB.println(ipResp);
     if (ipResp.indexOf('.') < 0) {                                 // no dot → no IP
-        SerialUSB.println(F("❌ NO IP"));
+        SerialUSB.println(F("NO IP"));
         return;
     }
 }
@@ -219,32 +298,76 @@ bool postHTTPS(const char* url, const String& payload) {
     return true;
 }
 
-/* --- SYNC RTC CLOCK WITH LTE MODEM --- */
-void syncRTC() {
-    // 1. Ask the module for its clock:  +CCLK: "yy/MM/dd,hh:mm:ss±zz"
-    String resp = sendAT("AT+CCLK?", 1000, false);    // e.g. +CCLK: "25/06/25,14:53:07+32"
+/* --- SYNC RTC and Location with GNSS --- */
+void syncSystem() {
+    sendAT("AT+CGPS=1,1");                   // Start GNSS in standalone mode
+    delay(1000);                             // Allow GNSS to initialize
 
-    int q1 = resp.indexOf('\"');
-    int q2 = resp.indexOf('\"', q1 + 1);
-    if (q1 < 0 || q2 < 0) {
-        SerialUSB.println(F("❌ CCLK malformed"));
-        return;                                       // malformed / timeout
+    String resp = sendAT("AT+CGPSINFO");
+    sendAT("AT+CGPS=0");                     // Turn GNSS off after use
+
+    int colon = resp.indexOf(':');
+    if (colon < 0) {
+        SerialUSB.println(F("Malformed CGPSINFO"));
+        return;
     }
 
-    String ts = resp.substring(q1 + 1, q2);           // 25/06/25,14:53:07+32
+    String payload = resp.substring(colon + 1);
+    payload.trim();
 
-    // 2. Split out the fields
-    int year   = 2000 + ts.substring(0, 2).toInt();   // 20yy
-    int month  =          ts.substring(3, 5).toInt();
-    int day    =          ts.substring(6, 8).toInt();
-    int hour   =          ts.substring(9,11).toInt();
-    int minute =          ts.substring(12,14).toInt();
-    int second =          ts.substring(15,17).toInt();
-    // (zone ±zz is ignored; rtc stores local time)
+    if (payload.indexOf(",,") >= 0) {
+        SerialUSB.println(F("No GPS fix"));
+        return;
+    }
 
-    // 3. Load RTCZero
+    // Extract fields: lat, N/S, lon, E/W, date, time, alt
+    char latStr[16], ns, lonStr[16], ew;
+    char date[7], time[10];
+    float alt;
+
+    int parsed = sscanf(payload.c_str(), "%15[^,],%c,%15[^,],%c,%6s,%9s,%f",
+                        latStr, &ns, lonStr, &ew, date, time, &alt);
+    if (parsed < 7) {
+        SerialUSB.println(F("Failed to parse CGPSINFO fields"));
+        return;
+    }
+
+    // ---- Convert to decimal degrees ----
+    float latDeg = atof(latStr);
+    float lonDeg = atof(lonStr);
+
+    float lat_dd = int(latDeg / 100);
+    float lat_mm = latDeg - lat_dd * 100;
+    location.latitude = lat_dd + lat_mm / 60.0;
+    if (ns == 'S') location.latitude *= -1;
+
+    float lon_dd = int(lonDeg / 100);
+    float lon_mm = lonDeg - lon_dd * 100;
+    location.longitude = lon_dd + lon_mm / 60.0;
+    if (ew == 'W') location.longitude *= -1;
+
+    location.altitude = alt;
+
+    // ---- Parse UTC date and time ----
+    int day    = (date[0] - '0') * 10 + (date[1] - '0');
+    int month  = (date[2] - '0') * 10 + (date[3] - '0');
+    int year   = 2000 + (date[4] - '0') * 10 + (date[5] - '0');
+
+    int hour   = (time[0] - '0') * 10 + (time[1] - '0');
+    int minute = (time[2] - '0') * 10 + (time[3] - '0');
+    int second = (time[4] - '0') * 10 + (time[5] - '0');
+
+    // ---- IN UTC ----
     rtc.setTime(hour, minute, second);
     rtc.setDate(day, month, year);
+
+    char gnssMsg[100];
+    snprintf(gnssMsg, sizeof(gnssMsg), "GNSS fix:  lat=%.6f  lon=%.6f  alt=%.1fm", location.latitude, location.longitude, location.altitude);
+    SerialUSB.println(gnssMsg);
+
+    char timeMsg[60];
+    snprintf(timeMsg, sizeof(timeMsg), "UTC time:  %02d/%02d/%04d %02d:%02d:%02d", day, month, year, hour, minute, second);
+    SerialUSB.println(timeMsg);
 }
 
 
@@ -267,6 +390,11 @@ bool sdHasCsvFiles() {
     }
     r.close();
     return false;
+}
+
+/* --- HTTPS UPLOAD HELPER --- */
+bool postDataHttps(const String& payload) {
+    return postHTTPS(HTTPS_URL, payload);
 }
 
 /* --- UPLOAD ALL CSV FILES CHRONOLOGICALLY --- */
