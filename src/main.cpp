@@ -108,7 +108,10 @@ void loop() {
             /* --- Upload Data via HTTPS --- */
             if (sdHasCsvFiles()) {
                 SerialUSB.println(F("Uploading saved data..."));
-                if (sdUploadChrono())
+                if (sdUploadChrono(postDataHttps)) {
+                    SerialUSB.println(F("Data upload successful."));
+                    sdDeleteCsv("data.csv"); // needs to be modified to delete all files
+                }
             }
             state = 1;
             break;
