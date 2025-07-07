@@ -14,7 +14,7 @@
 #define LTE_RESET_PIN   6
 #define LTE_PWRKEY_PIN  5
 #define LTE_FLIGHT_PIN  7
-#define SensorInterruptPin 2
+#define relayPin 3
 
 #define SLAVE_ADDRESS 0x08
 
@@ -148,9 +148,13 @@ void loop() {
             break;
         /* --- LOW POWER MODE --- */
         case 2:
+            /* --- Turn on Relay --- */
+            digitalWrite(relayPin, HIGH); // Turn on the relay to power the sensor
+            delay(1000); // Allow time for the sensor to power up
             /* --- SAMPLE DATA FROM SENSORS --- */
             sampleData();
-            /* --- SAVE DATA TO SD CARD --- */
+            /* --- Turn off Relay --- */
+            digitalWrite(relayPin, LOW);
             state = 1; // Return to low power mode
             break;
         default:
@@ -497,35 +501,66 @@ void processChunk(const String& data)
     }
 }
 
-/* --- PROCESS I²C CHUNK FROM ENVIROPRO --- */
+/* --- PROCESS I²C CHUNK FROM ENVIROPRO --- *//* -----------------------------------------------------------
+ *  SAMPLE DATA  – called once per hour from the state-machine
+ * --------------------------------------------------------- */
 void sampleData()
 {
-    /* still waiting for the last fragment? */
+    /* 1 ── still receiving an I²C block? */
     if (assembling) return;
 
-    /* ---------------- choose which buffer is ready -------- */
-    const String *src = 0;          // pointer to active string
-    const char   *tag = 0;          // "Moist" / "Temp"
-    if (curType == "Moist" && moistBuf.length()) { src = &moistBuf; tag = "Moist"; }
-    else if (curType == "Temp" && tempBuf.length()) { src = &tempBuf; tag = "Temp"; }
-    else return;                    // nothing complete yet
+    /* 2 ── need BOTH buffers ready */
+    if (!moistBuf.length() || !tempBuf.length()) return;
 
-    /* ---------------- ensure SD is present ---------------- */
-    if (!sdInit()) return;          // silent fail if no card
+    /* 3 ── strip the labels (“Moist,” / “Temp,”) ------------- */
+    String moistValues = moistBuf.substring(6);      // after "Moist,"
+    String tempValues  = tempBuf.substring(5);       // after "Temp,"
+    if (moistValues.endsWith(",")) moistValues.remove(moistValues.length() - 1);
+    if (tempValues.endsWith(","))  tempValues.remove(tempValues.length()  - 1);
 
-    /* ---------------- build   <Tag>_YYYYMMDD.CSV ---------- */
-    char fname[24];
+    /* 4 ── build timestamp ---------------------------------- */
     uint16_t yr  = rtc.getYear() + 2000;
     uint8_t  mon = rtc.getMonth();
     uint8_t  day = rtc.getDay();
-    snprintf(fname, sizeof(fname), "%s_%04u%02u%02u.CSV",
-             tag, yr, mon, day);
+    uint8_t  hr  = rtc.getHours();
+    uint8_t  min = rtc.getMinutes();
+    uint8_t  sec = rtc.getSeconds();
 
-    /* ---------------- append the row ---------------------- */
-    File f = SD.open(fname, FILE_WRITE);  // creates or re-opens
-    if (f) { f.println(*src); f.close(); }
+    char dateStr[11], timeStr[9];
+    snprintf(dateStr, sizeof(dateStr), "%04u-%02u-%02u", yr, mon, day);
+    snprintf(timeStr, sizeof(timeStr), "%02u:%02u:%02u", hr, min, sec);
 
-    /* ---------------- clear for next transmission --------- */
+    /* 5 ── compose CSV row ---------------------------------- */
+    String row  = String(dateStr) + "," + timeStr + ",";
+    row += String(location.latitude , 6) + ",";
+    row += String(location.longitude, 6) + ",";
+    row += String(location.altitude , 1) + ",";
+    row += tempValues + "," + moistValues + ",";   // placeholder for IR_Temp
+
+    /* 6 ── ensure SD present -------------------------------- */
+    if (!sdInit()) return;                          // silent if no card
+
+    /* 7 ── open / create daily file ------------------------- */
+    char fname[24];
+    snprintf(fname, sizeof(fname), "DATA_%04u%02u%02u.CSV", yr, mon, day);
+    bool newFile = !SD.exists(fname);
+
+    File f = SD.open(fname, FILE_WRITE);
+    if (!f) return;
+
+    /* 8 ── add header once per day -------------------------- */
+    if (newFile) {
+        f.println(F("date,time,lat,lon,alt,"
+                    "Temp10,Temp20,Temp30,Temp40,Temp50,Temp60,Temp70,Temp80,"
+                    "Moist10,Moist20,Moist30,Moist40,Moist50,Moist60,Moist70,Moist80,"
+                    "IR_Temp"));
+    }
+
+    /* 9 ── append the data row ------------------------------ */
+    f.println(row);
+    f.close();
+
+    /*10 ── clear for next hour ------------------------------ */
     moistBuf  = "";
     tempBuf   = "";
     curType   = "";
