@@ -5,6 +5,7 @@
 #include <ArduinoLowPower.h>
 #include <algorithm>
 #include <Wire.h>
+#include "secrets.h"
 
 #define BAUD 115200
 #define DEBUG true
