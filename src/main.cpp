@@ -5,7 +5,7 @@
 #include <ArduinoLowPower.h>
 #include <algorithm>
 #include <Wire.h>
-#include "secrets.h"
+#include <secrets.h>
 
 #define BAUD 115200
 #define DEBUG true
@@ -463,6 +463,38 @@ void writeTestCsvToSd(const char* filename) {
 
     file.close();
     SerialUSB.println("Test CSV written to SD");
+}
+
+/* --- PROCESS I²C CHUNK FROM ENVIROPRO --- */
+void processChunk(const String& data)
+{
+    /* 1 ── new transmission header ------------------------ */
+    if (data.startsWith("Moist,")) {
+        curType     = "Moist";
+        moistBuf    = data;          // start fresh
+        assembling  = true;
+        return;
+    }
+    if (data.startsWith("Temp,")) {
+        curType     = "Temp";
+        tempBuf     = data;
+        assembling  = true;
+        return;
+    }
+
+    /* 2 ── continuation of current block ----------------- */
+    if (assembling) {
+        if (curType == "Moist")      moistBuf += data;
+        else if (curType == "Temp")  tempBuf  += data;
+
+        /* 3 ── heuristic: a short (<15 B) fragment marks
+         *        the end of this transmission ------------- */
+        if (data.length() < 15) {
+            assembling = false;      // finished – ready for sampleData()
+            /*  let the state-machine call sampleData()
+                (case 2) to save the finished buffer        */
+        }
+    }
 }
 
 /* --- PROCESS I²C CHUNK FROM ENVIROPRO --- */
