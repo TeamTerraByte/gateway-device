@@ -4,6 +4,7 @@
 #include <RTCZero.h>
 #include <ArduinoLowPower.h>
 #include <algorithm>
+#include <Wire.h>
 
 #define BAUD 115200
 #define DEBUG true
@@ -12,10 +13,19 @@
 #define LTE_RESET_PIN   6
 #define LTE_PWRKEY_PIN  5
 #define LTE_FLIGHT_PIN  7
+#define SensorInterruptPin 2
+
+#define SLAVE_ADDRESS 0x08
+
+/* --- SENSOR DATA --- */
+String moistBuf = "";
+String tempBuf  = "";
+String curType  = "";
+bool   assembling = false;          // true while a block is still arriving
 
 /* --- CONSTANTS --- */
 const char HTTPS_URL[] =
-  "https://script.google.com/macros/s/AKfycbybv1kcHIaqrGik924pnxW2a3ZmDXkeCn56Kjliggc3300nkH5x6I6uC7_Eg2qZ_i4F/exec";
+  "https://script.google.com/macros/library/d/1rvzDuAqZ6itbzOK9yvIh91rE_fwE4jzhvqWYqHBdEaEOMM4oj2zmefAr/8";
 
 const int PIN_SD_SELECT = 4;
 
@@ -49,6 +59,8 @@ bool sdHasCsvFiles();
 bool sdUploadChrono(bool (*up)(const String&));
 bool sdDeleteCsv(const char* name);
 bool postDataHttps(const String& payload);
+void processChunk(const String& s);
+void sampleData();
 
 void setup() {
     // DEBUG SERIAL PORT
@@ -57,14 +69,13 @@ void setup() {
     // Initialize Serial1 for 4G LTE modem communication
     Serial1.begin(BAUD);
     while (!Serial1);
-    // Initialize Serial2 for LoRa communication
-    Serial2.begin(BAUD);
-    while (!Serial2);
+
+    // No LoRa for Version 1.0
 
     /* --- INITIALIZE RTC --- */
     rtc.begin();
     rtc.setTime(0, 0, 0);
-    rtc.setDate(1, 1, 2023); // Set initial date (1st Jan 2023)
+    rtc.setDate(1, 1, 25); // 1, 1, 2025
 
     /* --- INITIALIZE SD CARD --- */
     if (!sdInit()) {
@@ -76,6 +87,15 @@ void setup() {
         }
     }
 
+    /* --- INITIATE I2C FOR ENVIROPRO --- */
+    Wire.begin(SLAVE_ADDRESS);
+    Wire.onReceive([](int /*n*/) {
+        String chunk;
+        while (Wire.available())           // read all bytes of this I²C packet
+            chunk += char(Wire.read());
+        processChunk(chunk);               // assemble
+    });
+
     /* --- Initialize RTC --- */
     rtc.begin();
     rtc.setTime(0, 0, 0); // Set initial time to 00:00:00
@@ -85,24 +105,20 @@ void setup() {
     state = 0;
 }
 
+/* ======================================================== */
+/* |----------------- MAIN STATE MACHINE -----------------| */
+/* ======================================================== */
 void loop() {
 
     /* --- STATE MACHINE --- */
     switch (state) {
-        /* --- LoRa Network Set-up --- */
+        /* --- GATEWAY --- */
         case 0:
             /* --- Boot SIM7600 Modem --- */
             modemBoot();
             /* --- Sync System Time and Location --- */
             syncSystem();
-            /* --- Turn Off 4G LTE Modem --- */
-            modemOff();
-            /* --- BOOT LoRa MODULE --- */
-            /* --- BEGIN LORA COMMUNICATION (Send Network Acknowledgment and RTC INFO) --- */
-            /* --- LISTEN FOR LORA RESPONSES and SAVE DATA --- */
-            /* --- SHUT DOWN LoRa MODULE --- */
-            /* --- BOOT SIM7600 MODEM --- */
-            modemBoot();
+
             /* --- Attach to LTE Network --- */
             networkAttach();
             /* --- Upload Data via HTTPS --- */
@@ -113,38 +129,28 @@ void loop() {
                     sdDeleteCsv("data.csv"); // needs to be modified to delete all files
                 }
             }
+            hoursInDay = 0;
             state = 1;
             break;
-        /* --- GATEWAY --- */
-        case 1:
-            /* --- BOOT LoRa MODULE --- */
-            /* --- LISTEN FOR ENDPOINT DEVICE DATA (LoRa) --- */
-            /* --- SHUTDOWN LoRa MODULE --- */
-            /* --- SAMPLE SENSOR DATA --- */
-            /* --- BOOT SIM7500 MODEM --- */
-            /* --- Sinc RTC --- */
-            /* --- UPLOAD SAVED DATA VIA HTTPS --- */
-            /* --- GRACEFULLY SHUTDOWN MODEM --- */
-            hoursInDay = 0;
-            state = 2;
-            break;
         /* --- LOW POWER MODE --- */
-        case 2:
+        case 1:
             LowPower.deepSleep(heartBeatInterval); // Sleep for 1 hour
             if ( hoursInDay < 24 ) {
-                state = 3;
+                state = 2;
                 hoursInDay++;
                 break;
             } else {
-                state = 1;
+                state = 0;
                 hoursInDay = 0; // Reset the counter after 24 hours
                 break;
             }
             break;
-        case 3:
+        /* --- LOW POWER MODE --- */
+        case 2:
             /* --- SAMPLE DATA FROM SENSORS --- */
+            sampleData();
             /* --- SAVE DATA TO SD CARD --- */
-            state = 2; // Return to low power mode
+            state = 1; // Return to low power mode
             break;
         default:
             SerialUSB.println(F("Invalid state!"));
@@ -436,4 +442,58 @@ bool sdUploadChrono(bool (*up)(const String&)) {
 bool sdDeleteCsv(const char* name) {
     if (!sdInit()) return false;
     return SD.exists(name) && SD.remove(name);
+}
+
+/* --- System Validation --- */
+void writeTestCsvToSd(const char* filename) {
+    if (!SD.begin(PIN_SD_SELECT)) {
+        SerialUSB.println("SD card init failed");
+        return;
+    }
+
+    File file = SD.open(filename, FILE_WRITE);
+    if (!file) {
+        SerialUSB.println("Failed to open file");
+        return;
+    }
+
+    file.println("Type,Value1,Value2,Value3,Value4,Value5,Value6,Value7,Value8,Value9");
+    file.println("Sensor,12.3,45.6,78.9,10.1,11.2,13.3,14.4,15.5,16.6");
+
+    file.close();
+    SerialUSB.println("Test CSV written to SD");
+}
+
+/* --- PROCESS I²C CHUNK FROM ENVIROPRO --- */
+void sampleData()
+{
+    /* still waiting for the last fragment? */
+    if (assembling) return;
+
+    /* ---------------- choose which buffer is ready -------- */
+    const String *src = 0;          // pointer to active string
+    const char   *tag = 0;          // "Moist" / "Temp"
+    if (curType == "Moist" && moistBuf.length()) { src = &moistBuf; tag = "Moist"; }
+    else if (curType == "Temp" && tempBuf.length()) { src = &tempBuf; tag = "Temp"; }
+    else return;                    // nothing complete yet
+
+    /* ---------------- ensure SD is present ---------------- */
+    if (!sdInit()) return;          // silent fail if no card
+
+    /* ---------------- build   <Tag>_YYYYMMDD.CSV ---------- */
+    char fname[24];
+    uint16_t yr  = rtc.getYear() + 2000;
+    uint8_t  mon = rtc.getMonth();
+    uint8_t  day = rtc.getDay();
+    snprintf(fname, sizeof(fname), "%s_%04u%02u%02u.CSV",
+             tag, yr, mon, day);
+
+    /* ---------------- append the row ---------------------- */
+    File f = SD.open(fname, FILE_WRITE);  // creates or re-opens
+    if (f) { f.println(*src); f.close(); }
+
+    /* ---------------- clear for next transmission --------- */
+    moistBuf  = "";
+    tempBuf   = "";
+    curType   = "";
 }

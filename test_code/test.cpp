@@ -13,18 +13,19 @@
 /* --- SD CARD PIN --- */
 #define PIN_SD                  4
 /* --- HTTPS WEB SERVER URL --- */
-const char HTTPS_URL[]          = "https://script.google.com/macros/s/AKfycbybv1kcHIaqrGik924pnxW2a3ZmDXkeCn56Kjliggc3300nkH5x6I6uC7_Eg2qZ_i4F/exec";
+const char HTTPS_URL[]          = "https://script.google.com/macros/s/AKfycbxPDgN6Pmbi4LG1VH8K5ErdkMbWP5-nEJSJA-VsOoK8_l-gyn2nMPR9i8G2-jwduUnt-A/exec";
 
 Sd2Card                         card;
 File                            myFile;
 
 /* --- Function Declarations --- */
-String sendData(String command, const int timeout, boolean debug);
+String sendData(String command, const int timeout = 2000, boolean debug = DEBUG);
 String getTimeStr();
 void initSIM();
 void appendSample();
 void postBatch();
 void initSD();
+
 
 /* --- Setup --- */
 void setup() {
@@ -85,7 +86,7 @@ void postHTTPS(const char* https_url) {
     sendData("AT+HTTPPARA=\"CONTENT\",\"text/plain\"", 1000, DEBUG);
 
     // prepare payload
-    String payload = "hello-world\n1234,T,24.1,24.2,24.3,24.4,24.5,24.6,24.7,24.8\n";
+    String payload = "hello-world,1234,T,24.1,24.2,24.3,24.4,24.5,24.6,24.7,24.8\n";
 
     // wait for DOWNLOAD prompt
     String resp = sendData("AT+HTTPDATA=" + String(payload.length()) + ",10000", 1000, DEBUG);
