@@ -25,8 +25,8 @@ String curType  = "";
 bool   assembling = false;          // true while a block is still arriving
 
 /* --- CONSTANTS --- */
-const char HTTPS_URL[] =
-  "https://script.google.com/macros/library/d/1rvzDuAqZ6itbzOK9yvIh91rE_fwE4jzhvqWYqHBdEaEOMM4oj2zmefAr/8";
+const String HTTPS_URL =
+  String("http://api.thingspeak.com/update?api_key=") + API_WRITE_KEY;
 
 const int PIN_SD_SELECT = 4;
 
@@ -54,14 +54,14 @@ void modemOff();
 void networkAttach();
 String sendAT(const String& cmd, uint32_t to = 2000, bool dbg = DEBUG);
 void syncSystem();
-bool postHTTPS(const char* url, const String& payload);
+bool postHTTP(const char* url, const String& payload);
 bool sdInit();
 bool sdHasCsvFiles();
 bool sdUploadChrono(bool (*up)(const String&));
 bool sdDeleteCsv(const char* name);
-bool postDataHttps(const String& payload);
+bool postHTTP(const String& payload);
 void processChunk(const String& s);
-void sampleData();
+void sampleData(); 
 
 void setup() {
     // DEBUG SERIAL PORT
@@ -125,7 +125,7 @@ void loop() {
             /* --- Upload Data via HTTPS --- */
             if (sdHasCsvFiles()) {
                 SerialUSB.println(F("Uploading saved data..."));
-                if (sdUploadChrono(postDataHttps)) {
+                if (sdUploadChrono(postHTTP)) {
                     SerialUSB.println(F("Data upload successful."));
                     sdDeleteCsv("data.csv"); // needs to be modified to delete all files
                 }
@@ -268,8 +268,8 @@ void networkAttach() {
 
 /* --- SEND AT COMMAND to 4G LTE MODULE --- */
 String sendAT(const String& cmd,
-              uint32_t      to  = 2000,
-              bool          dbg = DEBUG)          // ▸ supply default for dbg
+              uint32_t      to,
+              bool          dbg)          // ▸ supply default for dbg
 {
     String resp;
     Serial1.println(cmd);                           // sends CR/LF automatically
@@ -282,8 +282,13 @@ String sendAT(const String& cmd,
     return resp;
 }
 
+/* --- HTTPS UPLOAD HELPER --- */
+bool postHTTP(const String& payload) {
+    return postHTTP(HTTPS_URL.c_str(), payload);
+}
+
 /* --- POST a text payload via HTTPS --- */
-bool postHTTPS(const char* url, const String& payload) {
+bool postHTTP(const char* url, const String& payload) {
     sendAT("AT+HTTPTERM", 1000, false);        // reset
     sendAT("AT+HTTPSSL=1");                    // enable TLS  (add this)
     sendAT("AT+HTTPINIT");
@@ -400,11 +405,6 @@ bool sdHasCsvFiles() {
     }
     r.close();
     return false;
-}
-
-/* --- HTTPS UPLOAD HELPER --- */
-bool postDataHttps(const String& payload) {
-    return postHTTPS(HTTPS_URL, payload);
 }
 
 /* --- UPLOAD ALL CSV FILES CHRONOLOGICALLY --- */
