@@ -54,7 +54,7 @@ bool modemBoot();
 void modemOff();
 void networkAttach();
 String sendAT(const String& cmd, uint32_t to = 2000, bool dbg = DEBUG);
-void syncSystem();
+bool syncSystem();
 bool sdInit();
 bool sdHasCsvFiles();
 bool sdUploadChrono(bool (*up)(const String&));
@@ -72,7 +72,6 @@ void setup() {
     Serial1.begin(BAUD);
     while (!Serial1);
 
-   
 
     /* --- INITIALIZE RTC --- */
     rtc.begin();
@@ -116,16 +115,18 @@ void loop() {
     switch (state) {
         /* --- GATEWAY --- */
         case 0:
+            SerialUSB.println("State 0");
             /* --- Boot SIM7600 Modem --- */
             while(!modemBoot()){
                 SerialUSB.println(F("Waiting for modem to boot..."));
                 delay(5000); // Wait before retrying
             }
-            /* --- Sync System Time and Location --- */
-            syncSystem();
-
+            
             /* --- Attach to LTE Network --- */
             networkAttach();
+
+            /* --- Sync System Time and Location --- */
+            syncSystem();
             /* --- Upload Data via HTTP --- */
             if (sdHasCsvFiles()) {
                 SerialUSB.println(F("Uploading saved data..."));
@@ -133,14 +134,18 @@ void loop() {
                     SerialUSB.println(F("Data upload successful."));
                     sdDeleteCsv("data.csv"); // needs to be modified to delete all files
                 }
+            } else if (DEBUG){
+                SerialUSB.println(F("No files on SD card to upload."));
             }
             hoursInDay = 0;
             state = 1;
             break;
         /* --- LOW POWER MODE --- */
         case 1:
-            LowPower.deepSleep(heartBeatInterval); // Sleep for 1 hour
-            if ( hoursInDay < 24 ) {
+            SerialUSB.println("State 1");
+            delay(heartBeatInterval);
+            // LowPower.deepSleep(heartBeatInterval); // Sleep for 1 hour
+            if ( hoursInDay < 1 ) {
                 state = 2;
                 hoursInDay++;
                 break;
@@ -152,6 +157,7 @@ void loop() {
             break;
         /* --- LOW POWER MODE --- */
         case 2:
+            SerialUSB.println("State 2");
             /* --- Turn on Relay --- */
             digitalWrite(relayPin, HIGH); // Turn on the relay to power the sensor
             delay(1000); // Allow time for the sensor to power up
@@ -324,77 +330,127 @@ bool postHTTP(const char* url, const String& payload) {
     return true;
 }
 
-/* --- SYNC RTC and Location with GNSS --- */
-void syncSystem() {
-    sendAT("AT+CGPS=1,1");                   // Start GNSS in standalone mode
-    delay(1000);                             // Allow GNSS to initialize
+bool syncSystem() {
+  // Configure NTP server and time zone (-5 for CST, for example)
+  if (!sendAT("AT+CNTP=\"pool.ntp.org\",-5").startsWith("OK")) {
+    if (DEBUG) SerialUSB.println("Failed to configure NTP");
+    return false;
+  }
 
-    String resp = sendAT("AT+CGPSINFO");
-    sendAT("AT+CGPS=0");                     // Turn GNSS off after use
+  delay(2000);  // Give it a moment to sync
 
-    int colon = resp.indexOf(':');
-    if (colon < 0) {
-        SerialUSB.println(F("Malformed CGPSINFO"));
-        return;
-    }
+  // Trigger NTP sync
+  if (!sendAT("AT+CNTP").startsWith("OK")) {
+    if (DEBUG) SerialUSB.println("Failed to initiate CNTP");
+    return false;
+  }
 
-    String payload = resp.substring(colon + 1);
-    payload.trim();
+  delay(5000);  // Wait for sync to complete
 
-    if (payload.indexOf(",,") >= 0) {
-        SerialUSB.println(F("No GPS fix"));
-        return;
-    }
+  // Read current time from the modem
+  String clkResp = sendAT("AT+CCLK?");
+  int idx = clkResp.indexOf("\"");
+  if (idx == -1) return false;
 
-    // Extract fields: lat, N/S, lon, E/W, date, time, alt
-    char latStr[16], ns, lonStr[16], ew;
-    char date[7], time[10];
-    float alt;
+  String timeStr = clkResp.substring(idx + 1, clkResp.indexOf("\"", idx + 1));
+  // Format: "yy/MM/dd,hh:mm:ss±zz"
 
-    int parsed = sscanf(payload.c_str(), "%15[^,],%c,%15[^,],%c,%6s,%9s,%f",
-                        latStr, &ns, lonStr, &ew, date, time, &alt);
-    if (parsed < 7) {
-        SerialUSB.println(F("Failed to parse CGPSINFO fields"));
-        return;
-    }
+  int year = timeStr.substring(0, 2).toInt() + 2000;
+  int month = timeStr.substring(3, 5).toInt();
+  int day = timeStr.substring(6, 8).toInt();
+  int hour = timeStr.substring(9, 11).toInt();
+  int minute = timeStr.substring(12, 14).toInt();
+  int second = timeStr.substring(15, 17).toInt();
 
-    // ---- Convert to decimal degrees ----
-    float latDeg = atof(latStr);
-    float lonDeg = atof(lonStr);
+  // Update the RTCZero object
+  rtc.setTime(hour, minute, second);
+  rtc.setDate(day, month, year);
 
-    float lat_dd = int(latDeg / 100);
-    float lat_mm = latDeg - lat_dd * 100;
-    location.latitude = lat_dd + lat_mm / 60.0;
-    if (ns == 'S') location.latitude *= -1;
+  if (DEBUG) {
+    SerialUSB.print("RTC updated to: ");
+    SerialUSB.print(year); SerialUSB.print("-");
+    SerialUSB.print(month); SerialUSB.print("-");
+    SerialUSB.print(day); SerialUSB.print(" ");
+    SerialUSB.print(hour); SerialUSB.print(":");
+    SerialUSB.print(minute); SerialUSB.print(":");
+    SerialUSB.println(second);
+  }
 
-    float lon_dd = int(lonDeg / 100);
-    float lon_mm = lonDeg - lon_dd * 100;
-    location.longitude = lon_dd + lon_mm / 60.0;
-    if (ew == 'W') location.longitude *= -1;
-
-    location.altitude = alt;
-
-    // ---- Parse UTC date and time ----
-    int day    = (date[0] - '0') * 10 + (date[1] - '0');
-    int month  = (date[2] - '0') * 10 + (date[3] - '0');
-    int year   = 2000 + (date[4] - '0') * 10 + (date[5] - '0');
-
-    int hour   = (time[0] - '0') * 10 + (time[1] - '0');
-    int minute = (time[2] - '0') * 10 + (time[3] - '0');
-    int second = (time[4] - '0') * 10 + (time[5] - '0');
-
-    // ---- IN UTC ----
-    rtc.setTime(hour, minute, second);
-    rtc.setDate(day, month, year);
-
-    char gnssMsg[100];
-    snprintf(gnssMsg, sizeof(gnssMsg), "GNSS fix:  lat=%.6f  lon=%.6f  alt=%.1fm", location.latitude, location.longitude, location.altitude);
-    SerialUSB.println(gnssMsg);
-
-    char timeMsg[60];
-    snprintf(timeMsg, sizeof(timeMsg), "UTC time:  %02d/%02d/%04d %02d:%02d:%02d", day, month, year, hour, minute, second);
-    SerialUSB.println(timeMsg);
+  return true;
 }
+
+
+/* --- SYNC RTC and Location with GNSS --- */
+// void syncSystem() {
+//     sendAT("AT+CGPS=1,1");                   // Start GNSS in standalone mode
+//     delay(1000);                             // Allow GNSS to initialize
+
+//     String resp = sendAT("AT+CGPSINFO");
+//     sendAT("AT+CGPS=0");                     // Turn GNSS off after use
+
+//     int colon = resp.indexOf(':');
+//     if (colon < 0) {
+//         SerialUSB.println(F("Malformed CGPSINFO"));
+//         return;
+//     }
+
+//     String payload = resp.substring(colon + 1);
+//     payload.trim();
+
+//     if (payload.indexOf(",,") >= 0) {
+//         SerialUSB.println(F("No GPS fix"));
+//         return;
+//     }
+
+//     // Extract fields: lat, N/S, lon, E/W, date, time, alt
+//     char latStr[16], ns, lonStr[16], ew;
+//     char date[7], time[10];
+//     float alt;
+
+//     int parsed = sscanf(payload.c_str(), "%15[^,],%c,%15[^,],%c,%6s,%9s,%f",
+//                         latStr, &ns, lonStr, &ew, date, time, &alt);
+//     if (parsed < 7) {
+//         SerialUSB.println(F("Failed to parse CGPSINFO fields"));
+//         return;
+//     }
+
+//     // ---- Convert to decimal degrees ----
+//     float latDeg = atof(latStr);
+//     float lonDeg = atof(lonStr);
+
+//     float lat_dd = int(latDeg / 100);
+//     float lat_mm = latDeg - lat_dd * 100;
+//     location.latitude = lat_dd + lat_mm / 60.0;
+//     if (ns == 'S') location.latitude *= -1;
+
+//     float lon_dd = int(lonDeg / 100);
+//     float lon_mm = lonDeg - lon_dd * 100;
+//     location.longitude = lon_dd + lon_mm / 60.0;
+//     if (ew == 'W') location.longitude *= -1;
+
+//     location.altitude = alt;
+
+//     // ---- Parse UTC date and time ----
+//     int day    = (date[0] - '0') * 10 + (date[1] - '0');
+//     int month  = (date[2] - '0') * 10 + (date[3] - '0');
+//     int year   = 2000 + (date[4] - '0') * 10 + (date[5] - '0');
+
+//     int hour   = (time[0] - '0') * 10 + (time[1] - '0');
+//     int minute = (time[2] - '0') * 10 + (time[3] - '0');
+//     int second = (time[4] - '0') * 10 + (time[5] - '0');
+
+//     // ---- IN UTC ----
+//     rtc.setTime(hour, minute, second);
+//     rtc.setDate(day, month, year);
+
+//     char gnssMsg[100];
+//     snprintf(gnssMsg, sizeof(gnssMsg), "GNSS fix:  lat=%.6f  lon=%.6f  alt=%.1fm", location.latitude, location.longitude, location.altitude);
+//     SerialUSB.println(gnssMsg);
+
+//     char timeMsg[60];
+//     snprintf(timeMsg, sizeof(timeMsg), "UTC time:  %02d/%02d/%04d %02d:%02d:%02d", day, month, year, hour, minute, second);
+//     SerialUSB.println(timeMsg);
+// }
 
 
 /* --- MOUNT SD CARD --- */
@@ -512,7 +568,8 @@ void processChunk(const String& data)
  *  SAMPLE DATA  – called once per hour from the state-machine
  * --------------------------------------------------------- */
 void sampleData()
-{
+{   
+    SerialUSB.println(F("SAMPLE DATA"));
     /* 1 ── still receiving an I²C block? */
     if (assembling) return;
 
@@ -553,7 +610,12 @@ void sampleData()
     bool newFile = !SD.exists(fname);
 
     File f = SD.open(fname, FILE_WRITE);
-    if (!f) return;
+    if (!f) {
+        if (DEBUG){
+            SerialUSB.println(F("Failed to open file for writing"));
+        }
+        return;
+    }
 
     /* 8 ── add header once per day -------------------------- */
     if (newFile) {
