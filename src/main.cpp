@@ -34,7 +34,8 @@ const int PIN_SD_SELECT = 4;
 uint8_t state = 0;
 
 /* --- DEEP SLEEP TIME VARIABLES --- */
-uint32_t heartBeatInterval = 3600000; // 1 hour in milliseconds
+// uint32_t heartBeatInterval = 3600000; // 1 hour in milliseconds
+uint32_t heartBeatInterval = 60000; // 1 minute in milliseconds
 uint8_t hoursInDay = 0; // Counter for hours in a day
 
 /* --- RTC OBJECT --- */
@@ -49,17 +50,17 @@ struct GNSS {
 GNSS location;
 
 /* --- FUNCTION DECLARATION --- */
-void modemBoot();
+bool modemBoot();
 void modemOff();
 void networkAttach();
 String sendAT(const String& cmd, uint32_t to = 2000, bool dbg = DEBUG);
 void syncSystem();
-bool postHTTP(const char* url, const String& payload);
 bool sdInit();
 bool sdHasCsvFiles();
 bool sdUploadChrono(bool (*up)(const String&));
 bool sdDeleteCsv(const char* name);
-bool postHTTP(const String& payload);
+bool postHTTP(const char* url, const String& payload);
+bool postHTTPData(const String& payload);
 void processChunk(const String& s);
 void sampleData(); 
 
@@ -71,7 +72,7 @@ void setup() {
     Serial1.begin(BAUD);
     while (!Serial1);
 
-    // No LoRa for Version 1.0
+   
 
     /* --- INITIALIZE RTC --- */
     rtc.begin();
@@ -116,16 +117,19 @@ void loop() {
         /* --- GATEWAY --- */
         case 0:
             /* --- Boot SIM7600 Modem --- */
-            modemBoot();
+            while(!modemBoot()){
+                SerialUSB.println(F("Waiting for modem to boot..."));
+                delay(5000); // Wait before retrying
+            }
             /* --- Sync System Time and Location --- */
             syncSystem();
 
             /* --- Attach to LTE Network --- */
             networkAttach();
-            /* --- Upload Data via HTTPS --- */
+            /* --- Upload Data via HTTP --- */
             if (sdHasCsvFiles()) {
                 SerialUSB.println(F("Uploading saved data..."));
-                if (sdUploadChrono(postHTTP)) {
+                if (sdUploadChrono(postHTTPData)) {
                     SerialUSB.println(F("Data upload successful."));
                     sdDeleteCsv("data.csv"); // needs to be modified to delete all files
                 }
@@ -211,7 +215,7 @@ void loop() {
 /* ---------------------------------- */
 
 /* --- BOOT MODEM SEQUENCE --- */
-void modemBoot() {
+bool modemBoot() {
     pinMode(LTE_RESET_PIN,  OUTPUT);
     pinMode(LTE_PWRKEY_PIN, OUTPUT);
     pinMode(LTE_FLIGHT_PIN, OUTPUT);
@@ -227,9 +231,10 @@ void modemBoot() {
     String ok = sendAT("AT", 1000, false);
     if (ok.indexOf("OK") < 0) {
         SerialUSB.println(F("MODEM NOT RESPONDING"));
-        return;
+        return false;
     }
     SerialUSB.println(F("MODEM READY"));
+    return true;
 }
 
 /* --- TURN OFF MODEM --- */
@@ -287,33 +292,35 @@ String sendAT(const String& cmd,
 }
 
 /* --- HTTPS UPLOAD HELPER --- */
-bool postHTTP(const String& payload) {
+bool postHTTPData(const String& payload) {
     return postHTTP(HTTPS_URL.c_str(), payload);
 }
 
 /* --- POST a text payload via HTTPS --- */
 bool postHTTP(const char* url, const String& payload) {
-    sendAT("AT+HTTPTERM", 1000, false);        // reset
-    sendAT("AT+HTTPSSL=1");                    // enable TLS  (add this)
-    sendAT("AT+HTTPINIT");
+    SerialUSB.println("Jacob" + payload);
 
-    sendAT("AT+HTTPPARA=\"CID\",1");
-    sendAT("AT+HTTPPARA=\"URL\",\"" + String(url) + "\"");
-    sendAT("AT+HTTPPARA=\"CONTENT\",\"text/plain\"");
+    // sendAT("AT+HTTPTERM", 1000, false);        // reset
+    // sendAT("AT+HTTPSSL=1");                    // enable TLS  (add this)
+    // sendAT("AT+HTTPINIT");
 
-    // upload body
-    String r = sendAT("AT+HTTPDATA=" + String(payload.length()) + ",10000", 1000);
-    if (r.indexOf("DOWNLOAD") < 0) return false;
-    Serial1.print(payload);
+    // sendAT("AT+HTTPPARA=\"CID\",1");
+    // sendAT("AT+HTTPPARA=\"URL\",\"" + String(url) + "\"");
+    // sendAT("AT+HTTPPARA=\"CONTENT\",\"text/plain\"");
 
-    // POST
-    String act = sendAT("AT+HTTPACTION=1", 20000);   // allow longer timeout
-    if (act.indexOf(",200,") < 0) return false;
+    // // upload body
+    // String r = sendAT("AT+HTTPDATA=" + String(payload.length()) + ",10000", 1000);
+    // if (r.indexOf("DOWNLOAD") < 0) return false;
+    // Serial1.print(payload);
 
-    // optional readback
-    /* String body = sendAT("AT+HTTPREAD", 3000); */
+    // // POST
+    // String act = sendAT("AT+HTTPACTION=1", 20000);   // allow longer timeout
+    // if (act.indexOf(",200,") < 0) return false;
 
-    sendAT("AT+HTTPTERM");
+    // // optional readback
+    // /* String body = sendAT("AT+HTTPREAD", 3000); */
+
+    // sendAT("AT+HTTPTERM");
     return true;
 }
 
