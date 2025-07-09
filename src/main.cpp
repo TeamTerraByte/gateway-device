@@ -25,8 +25,10 @@ String curType  = "";
 bool   assembling = false;          // true while a block is still arriving
 
 /* --- CONSTANTS --- */
-const char HTTPS_URL[] =
-  "https://script.google.com/macros/library/d/1rvzDuAqZ6itbzOK9yvIh91rE_fwE4jzhvqWYqHBdEaEOMM4oj2zmefAr/8";
+/* ---------- THINGSPEAK --------------------------------- */
+const char* TS_API_KEY   = API_WRITE_KEY;
+const char TS_BASE_URL[]  = "http://api.thingspeak.com/update";
+const uint8_t TS_MAX_FLD  = 8;
 
 const int PIN_SD_SELECT = 4;
 
@@ -57,11 +59,12 @@ void syncSystem();
 bool postHTTPS(const char* url, const String& payload);
 bool sdInit();
 bool sdHasCsvFiles();
-bool sdUploadChrono(bool (*up)(const String&));
+bool sdUploadChrono();
 bool sdDeleteCsv(const char* name);
-bool postDataHttps(const String& payload);
+//bool postDataHttps(const String& payload);
 void processChunk(const String& s);
 void sampleData();
+void sampleDataTest();
 
 void setup() {
     // DEBUG SERIAL PORT
@@ -100,7 +103,7 @@ void setup() {
     /* --- Initialize RTC --- */
     rtc.begin();
     rtc.setTime(0, 0, 0); // Set initial time to 00:00:00
-    rtc.setDate(1, 1, 2025); // Set initial date (1st Jan 2025)
+    rtc.setDate(1, 1, 25); // Set initial date (1st Jan 2025)
 
     /* --- INITIALIZE STATE MACHINE --- */
     state = 0;
@@ -125,7 +128,7 @@ void loop() {
             /* --- Upload Data via HTTPS --- */
             if (sdHasCsvFiles()) {
                 SerialUSB.println(F("Uploading saved data..."));
-                if (sdUploadChrono(postDataHttps)) {
+                if (sdUploadChrono()) {
                     SerialUSB.println(F("Data upload successful."));
                     sdDeleteCsv("data.csv"); // needs to be modified to delete all files
                 }
@@ -142,7 +145,9 @@ void loop() {
             break;
         /* --- LOW POWER MODE --- */
         case 1:
-            LowPower.deepSleep(heartBeatInterval); // Sleep for 1 hour
+            //LowPower.deepSleep();
+            delay(5000); // simulate 5 seconds of Low power mode
+
             if ( hoursInDay < 24 ) {
                 state = 2;
                 hoursInDay++;
@@ -159,7 +164,8 @@ void loop() {
             digitalWrite(relayPin, HIGH); // Turn on the relay to power the sensor
             delay(1000); // Allow time for the sensor to power up
             /* --- SAMPLE DATA FROM SENSORS --- */
-            sampleData();
+            //sampleData();
+            sampleDataTest(); // Test function to simulate data sampling
             /* --- Turn off Relay --- */
             digitalWrite(relayPin, LOW);
             state = 1; // Return to low power mode
@@ -278,10 +284,7 @@ void networkAttach() {
 }
 
 /* --- SEND AT COMMAND to 4G LTE MODULE --- */
-String sendAT(const String& cmd,
-              uint32_t      to  = 2000,
-              bool          dbg = DEBUG)          // ▸ supply default for dbg
-{
+String sendAT(const String& cmd, uint32_t to, bool dbg ){
     String resp;
     Serial1.println(cmd);                           // sends CR/LF automatically
 
@@ -294,30 +297,53 @@ String sendAT(const String& cmd,
 }
 
 /* --- POST a text payload via HTTPS --- */
-bool postHTTPS(const char* url, const String& payload) {
-    sendAT("AT+HTTPTERM", 1000, false);        // reset
-    sendAT("AT+HTTPSSL=1");                    // enable TLS  (add this)
-    sendAT("AT+HTTPINIT");
+bool postHTTPS(const char*, const String& payload)
+{
+    /* 0 ─ build form-encoded body: api_key & 8 fields (trimmed) */
+    String tokens[TS_MAX_FLD];
+    uint8_t n = 0, p = 0;
+    while (n < TS_MAX_FLD) {
+        int c = payload.indexOf(',', p);
+        if (c < 0) c = payload.length();
+        tokens[n++] = payload.substring(p, c);  tokens[n-1].trim();
+        p = c + 1;
+        if (c >= payload.length()) break;
+    }
+    String body = "api_key=" + String(TS_API_KEY);
+    for (uint8_t i = 0; i < n; ++i)
+        body += "&field" + String(i + 1) + "=" + tokens[i];
 
-    sendAT("AT+HTTPPARA=\"CID\",1");
-    sendAT("AT+HTTPPARA=\"URL\",\"" + String(url) + "\"");
-    sendAT("AT+HTTPPARA=\"CONTENT\",\"text/plain\"");
+    /* 1 ─ HTTP stack ---------------------------------------------- */
+    sendAT("AT+HTTPTERM", 1000, true);            // clean slate
+    sendAT("AT+HTTPSSL=1", 1000, true);           // ► TLS ON  ◄
+    // sendAT("AT+SHSSL=1,0,\"\"");               // (disable cert check if FW<2023)
+    sendAT("AT+HTTPINIT", 1000, true);
+    sendAT("AT+HTTPPARA=\"CID\",1", 1000, true);
+    sendAT("AT+HTTPPARA=\"URL\",\"https://api.thingspeak.com/update\"", 1000, true);
+    sendAT("AT+HTTPPARA=\"CONTENT\",\"application/x-www-form-urlencoded\"", 1000, true);
 
-    // upload body
-    String r = sendAT("AT+HTTPDATA=" + String(payload.length()) + ",10000", 1000);
-    if (r.indexOf("DOWNLOAD") < 0) return false;
-    Serial1.print(payload);
+    /* 2 ─ load POST body ------------------------------------------ */
+    String r = sendAT("AT+HTTPDATA=" + String(body.length()) + ",10000", 2000, true);
+    if (r.indexOf("DOWNLOAD") < 0) { sendAT("AT+HTTPTERM"); return false; }
+    Serial1.print(body);
+    delay(150);
 
-    // POST
-    String act = sendAT("AT+HTTPACTION=1", 20000);   // allow longer timeout
-    if (act.indexOf(",200,") < 0) return false;
+    /* 3 ─ POST ----------------------------------------------------- */
+    sendAT("AT+HTTPACTION=1", 500, true);         // 1 = POST
 
-    // optional readback
-    /* String body = sendAT("AT+HTTPREAD", 3000); */
+    String act; uint32_t t0 = millis();
+    while (millis() - t0 < 25000) {               // wait ≤25 s for unsolicited line
+        act += sendAT("", 250, true);
+        if (act.indexOf("+HTTPACTION:") >= 0) break;
+    }
+    sendAT("AT+HTTPTERM", 1000, true);
 
-    sendAT("AT+HTTPTERM");
-    return true;
+    bool ok = (act.indexOf(",200,") >= 0);
+    SerialUSB.println(ok ? F("ThingSpeak: OK") : F("ThingSpeak: FAIL"));
+    return ok;
 }
+
+
 
 /* --- SYNC RTC and Location with GNSS --- */
 void syncSystem() {
@@ -414,41 +440,62 @@ bool sdHasCsvFiles() {
 }
 
 /* --- HTTPS UPLOAD HELPER --- */
-bool postDataHttps(const String& payload) {
-    return postHTTPS(HTTPS_URL, payload);
-}
+//bool postDataHttps(const String& payload) {
+//    return postHTTPS(HTTPS_URL, payload);
+//}
 
 /* --- UPLOAD ALL CSV FILES CHRONOLOGICALLY --- */
-bool sdUploadChrono(bool (*up)(const String&)) {
+/* ── Upload every *.CSV row-by-row in chronological order ──────────────── */
+bool sdUploadChrono()
+{
     if (!sdInit()) return false;
-    String list[32]; int n = 0;
-    File r = SD.open("/");
-    while (File f = r.openNextFile()) {
+
+    /* 1 ─ collect filenames */
+    String list[32]; uint8_t n = 0;
+    File dir = SD.open("/");
+    while (File f = dir.openNextFile()) {
         if (!f.isDirectory() && String(f.name()).endsWith(".CSV") && n < 32)
             list[n++] = String(f.name());
         f.close();
     }
-    r.close();
+    dir.close();
     if (!n) return false;
-    for (int i = 0; i < n - 1; ++i)
-        for (int j = i + 1; j < n; ++j)
+
+    /* 2 ─ sort alphabetically (lexicographic ≈ chronological) */
+    for (uint8_t i = 0; i < n - 1; ++i)
+        for (uint8_t j = i + 1; j < n; ++j)
             if (list[j] < list[i]) std::swap(list[i], list[j]);
-    for (int i = 0; i < n; ++i) {
+
+    /* 3 ─ stream each file row-by-row */
+    for (uint8_t i = 0; i < n; ++i) {
         File f = SD.open(list[i], FILE_READ);
         if (!f) continue;
+
         String row = "";
         while (f.available()) {
             char c = f.read();
-            if (c == '\n') {
-                if (!up(row)) { f.close(); return false; }
+            if (c == '\n') {                    // got one complete row
+                row.trim();                     // remove CR if any
+
+                /* skip header or empty lines (contains alpha chars) */
+                bool hasAlpha = false;
+                for (char ch : row) { if (isalpha(ch)) { hasAlpha = true; break; } }
+                if (!row.length() || hasAlpha) { row = ""; continue; }
+
+                if (!postHTTPS(nullptr, row)) { // push to ThingSpeak
+                    f.close(); return false;    // abort on first failure
+                }
                 row = "";
-            } else if (c != '\r') row += c;
+            }
+            else if (c != '\r') row += c;       // build row
         }
         f.close();
-        SD.remove(list[i]);
+        SD.remove(list[i]);                     // delete file after upload
     }
     return true;
 }
+
+
 
 /* --- DELETE --- */
 bool sdDeleteCsv(const char* name) {
@@ -571,4 +618,17 @@ void sampleData()
     moistBuf  = "";
     tempBuf   = "";
     curType   = "";
+}
+
+void sampleDataTest() {
+    // Simulate data sampling for testing purposes
+    File writeFile = SD.open("test.csv", FILE_WRITE);
+    if (!writeFile) {
+      SerialUSB.println("Error opening test.csv for data write");
+    } else {
+      SerialUSB.print("Writing test data… ");
+      writeFile.println("12345, 67.8, 90.1, 234.5, 12.3456, -98.7654");
+      writeFile.close();
+      SerialUSB.println("done.");
+    }
 }
