@@ -75,6 +75,11 @@ void setup(){
     Serial1.begin(BAUD);
     while (!Serial1);
 
+    /* --- INITIALIZE LTE PINS --- */
+    pinMode(LTE_RESET_PIN, OUTPUT);
+    pinMode(LTE_PWRKEY_PIN, OUTPUT);
+    pinMode(LTE_FLIGHT_PIN, OUTPUT);
+
     /* --- INITIALIZE SD CARD --- */
     if (!sdInit()) {
         SerialUSB.println(F("SD CARD NOT READY!"));
@@ -106,10 +111,6 @@ void loop(){
         /* --- GATEWAY AND TRANSMIT --- */
         case 0:
             if (DEBUG) SerialUSB.println("State 0");
-            /* --- Boot SIM7600 Modem --- */
-            // ltePowerSequence();  // this is called in uploadData which is called by sdUploadChrono
-            /* --- Sync System Time and Location --- */
-            enableTimeUpdates();
 
             /* --- Upload Data via HTTPS --- */
             if (sdHasCsvFiles()) {
@@ -162,7 +163,7 @@ void loop(){
 /* ======================================================== */
 void ltePowerSequence(){
     if (DEBUG) SerialUSB.println("Initiating ltePowerSequence");
-    delay(100);
+    
     digitalWrite(LTE_RESET_PIN, HIGH);
     delay(2000);
     digitalWrite(LTE_RESET_PIN, LOW);
@@ -173,18 +174,18 @@ void ltePowerSequence(){
     delay(2000);
     digitalWrite(LTE_PWRKEY_PIN, LOW);
 
-    pinMode(LTE_FLIGHT_PIN, OUTPUT);
     digitalWrite(LTE_FLIGHT_PIN, LOW); // Normal mode
 
     delay(30000); // Wait for LTE module
 
     // LTE network setup
-    sendAT("AT+CCID", 3000, DEBUG);
-    sendAT("AT+CREG?", 3000, DEBUG);
-    sendAT("AT+CGATT=1", 1000, DEBUG);
-    sendAT("AT+CGACT=1,1", 1000, DEBUG);
-    sendAT("AT+CGDCONT=1,\"IP\",\"fast.t-mobile.com\"", 1000, DEBUG);
-    sendAT("AT+CGPADDR=1", 3000, DEBUG);          // show pdp address
+    sendAT("AT+CCID", 3000);
+    sendAT("AT+CREG?", 3000);
+    sendAT("AT+CGATT=1", 1000);
+    sendAT("AT+CGACT=1,1", 1000);
+    sendAT("AT+CGDCONT=1,\"IP\",\"fast.t-mobile.com\"", 1000);
+    sendAT("AT+CGPADDR=1", 3000);          // show pdp address
+    enableTimeUpdates();
 }
 
 void modemOff() {
@@ -206,7 +207,7 @@ String sendAT(const String& cmd, uint32_t to, bool dbg ){
 }
 
 void enableTimeUpdates(){
-  String r = sendAT("AT+CTZU=1");
+  sendAT("AT+CTZU=1");
 }
 
 String getTime(){
@@ -264,6 +265,7 @@ bool uploadData(const String& payload) {
 		SerialUSB.println(F("HTTPINIT failed – aborting"));
 		return false;
 	}
+    sendAT("AT+HTTPPARA=\"CID\",1");  // Idk if this is necessary
 	sendAT("AT+HTTPPARA=\"CONTENT\",\"application/x-www-form-urlencoded\"", 1000);
 	sendAT("AT+HTTPPARA=\"URL\",\"" + url + "\"", 2000);
 
@@ -273,7 +275,7 @@ bool uploadData(const String& payload) {
 		SerialUSB.println(F("Upload OK"));
 		success = true;
 	} else {
-		SerialUSB.println("Upload failed: " + resp);
+		SerialUSB.println("Upload failed");
 	}
 	sendAT("AT+HTTPTERM", 1000);
 	
@@ -432,7 +434,11 @@ void sampleData()
     row += String(location.latitude , 6) + ",";
     row += String(location.longitude, 6) + ",";
     row += String(location.altitude , 1) + "\t";
-    row += tempValues + "\t" + moistValues + "\tNo IR";   // placeholder for IR_Temp
+    row += tempValues + "\t" + moistValues + "\t0.0,0.0";   // placeholder for IR_Temp
+    
+    row.replace("\n", "");
+    row.replace(" ", "%20");  // url encoding
+
 
     /* 6 ── ensure SD present -------------------------------- */
     if (!sdInit()) {
@@ -453,7 +459,6 @@ void sampleData()
     }
 
     /* 9 ── append the data row ------------------------------ */
-    row.replace("\n", "");
     if (DEBUG) SerialUSB.println("Writing row to SD: " + row);
     f.println(row);
     f.close();
