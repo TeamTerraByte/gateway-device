@@ -107,7 +107,7 @@ void loop(){
         case 0:
             if (DEBUG) SerialUSB.println("State 0");
             /* --- Boot SIM7600 Modem --- */
-            ltePowerSequence();
+            // ltePowerSequence();  // this is called in uploadData which is called by sdUploadChrono
             /* --- Sync System Time and Location --- */
             enableTimeUpdates();
 
@@ -132,9 +132,9 @@ void loop(){
         /* --- WAITING MODE --- */
         case 1:
             if (DEBUG) SerialUSB.println("State 1");
-            delay(60000); // simulate 1 minute of Low power mode
-
+            
             if ( hoursInDay < 1 ) {
+                delay(15000); // simulate 15 seconds of Low power mode
                 state = 2;
                 hoursInDay++;
                 break;
@@ -161,29 +161,30 @@ void loop(){
 /* |--------------- FUNCTION DEFINITIONS -----------------| */
 /* ======================================================== */
 void ltePowerSequence(){
-  delay(100);
-  digitalWrite(LTE_RESET_PIN, HIGH);
-  delay(2000);
-  digitalWrite(LTE_RESET_PIN, LOW);
+    if (DEBUG) SerialUSB.println("Initiating ltePowerSequence");
+    delay(100);
+    digitalWrite(LTE_RESET_PIN, HIGH);
+    delay(2000);
+    digitalWrite(LTE_RESET_PIN, LOW);
 
-  
-  delay(100);
-  digitalWrite(LTE_PWRKEY_PIN, HIGH);
-  delay(2000);
-  digitalWrite(LTE_PWRKEY_PIN, LOW);
+    
+    delay(100);
+    digitalWrite(LTE_PWRKEY_PIN, HIGH);
+    delay(2000);
+    digitalWrite(LTE_PWRKEY_PIN, LOW);
 
-  pinMode(LTE_FLIGHT_PIN, OUTPUT);
-  digitalWrite(LTE_FLIGHT_PIN, LOW); // Normal mode
+    pinMode(LTE_FLIGHT_PIN, OUTPUT);
+    digitalWrite(LTE_FLIGHT_PIN, LOW); // Normal mode
 
-  delay(30000); // Wait for LTE module
+    delay(30000); // Wait for LTE module
 
-  // LTE network setup
-  sendAT("AT+CCID", 3000, DEBUG);
-  sendAT("AT+CREG?", 3000, DEBUG);
-  sendAT("AT+CGATT=1", 1000, DEBUG);
-  sendAT("AT+CGACT=1,1", 1000, DEBUG);
-  sendAT("AT+CGDCONT=1,\"IP\",\"fast.t-mobile.com\"", 1000, DEBUG);
-  sendAT("AT+CGPADDR=1", 3000, DEBUG);          // show pdp address
+    // LTE network setup
+    sendAT("AT+CCID", 3000, DEBUG);
+    sendAT("AT+CREG?", 3000, DEBUG);
+    sendAT("AT+CGATT=1", 1000, DEBUG);
+    sendAT("AT+CGACT=1,1", 1000, DEBUG);
+    sendAT("AT+CGDCONT=1,\"IP\",\"fast.t-mobile.com\"", 1000, DEBUG);
+    sendAT("AT+CGPADDR=1", 3000, DEBUG);          // show pdp address
 }
 
 void modemOff() {
@@ -239,6 +240,7 @@ String tsvToFieldString(const String &tsvLine)
 }
 
 bool uploadData(const String& payload) {
+    if (DEBUG) SerialUSB.println("uploadData payload: " + payload);
 	bool success = false;
 
 	// For some reason, I have only observed consistent success using HTTP
@@ -334,9 +336,7 @@ bool sdUploadChrono()
                 row.trim();                     // remove CR if any
 
                 /* skip header or empty lines (contains alpha chars) */
-                bool hasAlpha = false;
-                for (char ch : row) { if (isalpha(ch)) { hasAlpha = true; break; } }
-                if (!row.length() || hasAlpha) { row = ""; continue; }
+                if (!row.length()) { continue; }
 
                 if (!uploadData(row)) { // push to ThingSpeak
                     f.close(); return false;    // abort on first failure
@@ -451,15 +451,9 @@ void sampleData()
         SerialUSB.println("New file: " + newFile);
         return;
     }
-    /* 8 ── add header once per day -------------------------- */
-    if (newFile) {
-        f.println(F("date\ttime\tlat\tlon\talt\t"
-                    "Temp10\tTemp20\tTemp30\tTemp40\tTemp50\tTemp60\tTemp70\tTemp80\t"
-                    "Moist10\tMoist20\tMoist30\tMoist40\tMoist50\tMoist60\tMoist70\tMoist80\t"
-                    "IR_Temp"));
-    }
 
     /* 9 ── append the data row ------------------------------ */
+    row.replace("\n", "");
     if (DEBUG) SerialUSB.println("Writing row to SD: " + row);
     f.println(row);
     f.close();
