@@ -44,15 +44,19 @@ void setup() {
   }
   SerialUSB.println("initialization done.");
 
+  // name limit is 8 characters
+  String fileName = "12345678.csv";
+
+
   // Write header if needed…
   bool needHeader = true;
-  if (SD.exists("test.csv")) {
-    File tmp = SD.open("test.csv", FILE_READ);
+  if (SD.exists(fileName)) {
+    File tmp = SD.open(fileName, FILE_READ);
     if (tmp && tmp.size() > 0) needHeader = false;
     if (tmp) tmp.close();
   }
   if (needHeader) {
-    File hdr = SD.open("test.csv", FILE_WRITE);
+    File hdr = SD.open(fileName, FILE_WRITE);
     if (hdr) {
       SerialUSB.print("Writing header… ");
       hdr.println("time, temperature, humidity, pressure, altitude, latitude, longitude");
@@ -63,9 +67,9 @@ void setup() {
 
   // ─── Write one line of test data ───────────────────────────────────
   {
-    File writeFile = SD.open("test.csv", FILE_WRITE);
+    File writeFile = SD.open(fileName, FILE_WRITE);
     if (!writeFile) {
-      SerialUSB.println("Error opening test.csv for data write");
+      SerialUSB.println("Error opening " + fileName + " for data write");
     } else {
       SerialUSB.print("Writing test data… ");
       writeFile.println("12345, 67.8, 90.1, 234.5, 12.3456, -98.7654");
@@ -76,10 +80,10 @@ void setup() {
 
   // ─── Read back the file contents ──────────────────────────────────
   {
-    SerialUSB.println("Reading back test.csv contents:");
-    File readFile = SD.open("test.csv", FILE_READ);
+    SerialUSB.println("Reading back "+ fileName +" contents:");
+    File readFile = SD.open(fileName, FILE_READ);
     if (!readFile) {
-      SerialUSB.println("Error opening test.csv for read");
+      SerialUSB.println("Error opening fileName for read");
     } else {
       while (readFile.available()) {
         SerialUSB.write(readFile.read());

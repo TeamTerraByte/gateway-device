@@ -61,6 +61,8 @@ bool sdHasCsvFiles();
 bool sdUploadChrono();
 bool sdDeleteCsv(const char* name);
 void processChunk(const String& data);
+void sampleData();
+String tsvToFieldString(const String &tsvLine);
 
 
 /* ======================================================== */
@@ -68,6 +70,7 @@ void processChunk(const String& data);
 /* ======================================================== */
 void setup(){
     SerialUSB.begin(BAUD);
+    if (DEBUG) while(!SerialUSB);  // wait
     delay(1000);
     Serial1.begin(BAUD);
     while (!Serial1);
@@ -79,7 +82,7 @@ void setup(){
         while (true) {
             delay(1000);
             SerialUSB.println(F("Waiting for SD card..."));
-        }
+        }   
     }
 
     /* --- INITIATE I2C FOR ENVIROPRO --- */
@@ -92,6 +95,7 @@ void setup(){
     });
 
     state = 0;
+    SerialUSB.println("Setup complete!");
 }
 
 /* ======================================================== */
@@ -101,6 +105,7 @@ void loop(){
     switch(state) {
         /* --- GATEWAY AND TRANSMIT --- */
         case 0:
+            if (DEBUG) SerialUSB.println("State 0");
             /* --- Boot SIM7600 Modem --- */
             ltePowerSequence();
             /* --- Sync System Time and Location --- */
@@ -113,6 +118,9 @@ void loop(){
                     SerialUSB.println(F("Data upload successful."));
                     sdDeleteCsv("data.csv"); // needs to be modified to delete all files
                 }
+                else {
+                    SerialUSB.println("Data upload unsuccessful");
+                }
             }
             delay(1000); // Allow time for the sensor to power up
             /* --- Sample Data from Sensors --- */
@@ -123,9 +131,10 @@ void loop(){
             break;
         /* --- WAITING MODE --- */
         case 1:
+            if (DEBUG) SerialUSB.println("State 1");
             delay(60000); // simulate 1 minute of Low power mode
 
-            if ( hoursInDay < 24 ) {
+            if ( hoursInDay < 1 ) {
                 state = 2;
                 hoursInDay++;
                 break;
@@ -137,12 +146,7 @@ void loop(){
             break;
         /* --- COLLECTION MODE --- */
         case 2:
-            /* --- Turn on Relay --- */
-            digitalWrite(relayPin, HIGH); // Turn on the relay to power the sensor
-            delay(1000); // Allow time for the sensor to power up
-   
-            /* --- Turn off Relay --- */
-            digitalWrite(relayPin, LOW);
+            // if (DEBUG) SerialUSB.println("State 2");
             state = 1; // Return to low power mode
             break;
         default:
@@ -214,34 +218,39 @@ String getTime(){
 	return time;
 }
 
-bool uploadData(const String& payload) {
-	// TODO change moistBuf and tempBuf usage to payload usage
-	bool success = false;
-	moistBuf.replace("\n", "");
-	moistBuf.replace("\r", "");
-	tempBuf.replace("\n", "");
-	tempBuf.replace("\r", "");
+String tsvToFieldString(const String &tsvLine)
+{
+  String out;
+  int start = 0, fieldNo = 1;
 
-	if (moistBuf.length() == 0 || tempBuf.length() ==0){
-		SerialUSB.println("! Upload cancelled, moistBuf or tempBuf empty");
-		return;  // I'm not sure how I'm uploading empty buffers
-	}
+  while (start < tsvLine.length()) {
+    int end = tsvLine.indexOf('\t', start);    // next TAB
+    if (end == -1) end = tsvLine.length();     // last value
+
+    out += "field";
+    out += fieldNo++;
+    out += '=';
+    out += tsvLine.substring(start, end);
+
+    if (end < tsvLine.length()) out += '&';    // no '&' after last field
+    start = end + 1;                           // jump past TAB
+  }
+  return out;
+}
+
+bool uploadData(const String& payload) {
+	bool success = false;
 
 	// For some reason, I have only observed consistent success using HTTP
 	// if I reset LTE before every query
 	ltePowerSequence(); 
 
-	/* ---- Extract numeric part (strip label & trailing comma) -------- */
-	String moistVal = moistBuf.substring(6);   // after "Moist,"
-	String tempVal  = tempBuf.substring(5);    // after "Temp,"
-
-	if (moistVal.endsWith(",")) moistVal.remove(moistVal.length() - 1);
-	if (tempVal.endsWith(","))  tempVal.remove(tempVal.length()  - 1);
-
 	/* ---- Build ThingSpeak URL -------------------------------------- */
 	String url = "http://api.thingspeak.com/update?api_key=";
 	url += API_WRITE_KEY;
-	url += "&field1=" + moistVal + "&field2=" + tempVal;
+    url += "&";
+    url += tsvToFieldString(payload);
+    
 
 	SerialUSB.println("\n[HTTP] » " + url);
 
@@ -251,7 +260,7 @@ bool uploadData(const String& payload) {
 	}
 	if (sendAT("AT+HTTPINIT", 5000).indexOf("OK") == -1) {
 		SerialUSB.println(F("HTTPINIT failed – aborting"));
-		return;
+		return false;
 	}
 	sendAT("AT+HTTPPARA=\"CONTENT\",\"application/x-www-form-urlencoded\"", 1000);
 	sendAT("AT+HTTPPARA=\"URL\",\"" + url + "\"", 2000);
@@ -266,8 +275,6 @@ bool uploadData(const String& payload) {
 	}
 	sendAT("AT+HTTPTERM", 1000);
 	
-	moistBuf = ""; // Clear for next transmission
-	tempBuf = ""; // Clear for next transmission
 	return success;
 }
 
@@ -353,6 +360,7 @@ bool sdDeleteCsv(const char* name) {
 /* --- PROCESS I²C CHUNK FROM ENVIROPRO --- */
 void processChunk(const String& data)
 {
+    SerialUSB.println("Processing Chunk: " + data);
     /* 1 ── new transmission header ------------------------ */
     if (data.startsWith("Moist,")) {
         curType     = "Moist";
@@ -386,12 +394,19 @@ void processChunk(const String& data)
  *  SAMPLE DATA  – called once per hour from the state-machine
  * --------------------------------------------------------- */
 void sampleData()
-{
+{   
+    if (DEBUG) SerialUSB.println("Attempting to sample data");
     /* 1 ── still receiving an I²C block? */
-    if (assembling) return;
+    if (assembling) {
+        if (DEBUG) SerialUSB.println("Sample cancelled, still assembling");
+        return;
+    }
 
     /* 2 ── need BOTH buffers ready */
-    if (!moistBuf.length() || !tempBuf.length()) return;
+    if (!moistBuf.length() || !tempBuf.length()) {
+        Serial.println("Sample cancelled, one buffer not ready");
+        return;
+    }
 
     /* 3 ── strip the labels (“Moist,” / “Temp,”) ------------- */
     String moistValues = moistBuf.substring(6);      // after "Moist,"
@@ -409,36 +424,43 @@ void sampleData()
     uint8_t  sec = time.substring(15,17).toInt();
 
     char dateStr[11], timeStr[9];
-    snprintf(dateStr, sizeof(dateStr), "%04u-%02u-%02u", yr, mon, day);
+    snprintf(dateStr, sizeof(dateStr), "%02u-%02u-%02u", yr, mon, day);
     snprintf(timeStr, sizeof(timeStr), "%02u:%02u:%02u", hr, min, sec);
 
     /* 5 ── compose CSV row ---------------------------------- */
-    String row  = String(dateStr) + "," + timeStr + ",";
+    String row  = String(dateStr) + "\t" + timeStr + "\t";
     row += String(location.latitude , 6) + ",";
     row += String(location.longitude, 6) + ",";
-    row += String(location.altitude , 1) + ",";
-    row += tempValues + "," + moistValues + ",";   // placeholder for IR_Temp
+    row += String(location.altitude , 1) + "\t";
+    row += tempValues + "\t" + moistValues + "\tNo IR";   // placeholder for IR_Temp
 
     /* 6 ── ensure SD present -------------------------------- */
-    if (!sdInit()) return;                          // silent if no card
+    if (!sdInit()) {
+        SerialUSB.println("Failed to initialize SD card");
+        return;                          // silent if no card
+    }
 
     /* 7 ── open / create daily file ------------------------- */
     char fname[24];
-    snprintf(fname, sizeof(fname), "DATA_%04u%02u%02u.CSV", yr, mon, day);
+    snprintf(fname, sizeof(fname), "D%02u%02u%02u.CSV", yr, mon, day);
     bool newFile = !SD.exists(fname);
 
     File f = SD.open(fname, FILE_WRITE);
-    if (!f) return;
-
+    if (!f) {
+        SerialUSB.println("Failed to open file " + (String)fname);
+        SerialUSB.println("New file: " + newFile);
+        return;
+    }
     /* 8 ── add header once per day -------------------------- */
     if (newFile) {
-        f.println(F("date,time,lat,lon,alt,"
-                    "Temp10,Temp20,Temp30,Temp40,Temp50,Temp60,Temp70,Temp80,"
-                    "Moist10,Moist20,Moist30,Moist40,Moist50,Moist60,Moist70,Moist80,"
+        f.println(F("date\ttime\tlat\tlon\talt\t"
+                    "Temp10\tTemp20\tTemp30\tTemp40\tTemp50\tTemp60\tTemp70\tTemp80\t"
+                    "Moist10\tMoist20\tMoist30\tMoist40\tMoist50\tMoist60\tMoist70\tMoist80\t"
                     "IR_Temp"));
     }
 
     /* 9 ── append the data row ------------------------------ */
+    if (DEBUG) SerialUSB.println("Writing row to SD: " + row);
     f.println(row);
     f.close();
 
