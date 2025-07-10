@@ -524,8 +524,7 @@ void writeTestCsvToSd(const char* filename) {
 }
 
 /* --- PROCESS I²C CHUNK FROM ENVIROPRO --- */
-void processChunk(const String& data)
-{
+void processChunk(const String& data){
     /* 1 ── new transmission header ------------------------ */
     if (data.startsWith("Moist,")) {
         curType     = "Moist";
@@ -555,7 +554,7 @@ void processChunk(const String& data)
     }
 }
 
-/* --- PROCESS I²C CHUNK FROM ENVIROPRO --- *//* -----------------------------------------------------------
+/*-----------------------------------------------------------
  *  SAMPLE DATA  – called once per hour from the state-machine
  * --------------------------------------------------------- */
 void sampleData()
