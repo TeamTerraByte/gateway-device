@@ -17,9 +17,11 @@ String Apikey = API_WRITE_KEY; // ThingSpeak API Key
 
 // function prototypes
 void resetLTE();
-String sendData(String command, const int timeout, boolean debug);
+String sendAT(const String& cmd, uint32_t to = 2000, bool dbg = DEBUG);
 void flushSerial1Input();
 void ltePowerSequence();
+void enableTimeUpdates();
+String getTime();
 
 void setup() {
   SerialUSB.begin(115200);
@@ -41,17 +43,19 @@ void loop() {
   }
 
   // Send to ThingSpeak
-  sendData("AT+HTTPINIT", 2000, DEBUG);
-  String http_str = "AT+HTTPPARA=\"URL\",\"http://api.thingspeak.com/update?api_key=" + Apikey + "&field1=" + "Goober" + "\"";
-  sendData(http_str, 2000, DEBUG);
-  sendData("AT+HTTPPARA=\"CONTENT\",\"application/x-www-form-urlencoded\"", 1000, DEBUG);
-  sendData("AT+HTTPACTION=0", 30000, DEBUG);
-  sendData("AT+HTTPTERM", 3000, DEBUG);
+  sendAT("AT+HTTPINIT", 2000, DEBUG);
+  String http_str = "AT+HTTPPARA=\"URL\",\"http://api.thingspeak.com/update?api_key=" + Apikey + "&field1=" + "Goofy" + "\"";
+  sendAT(http_str, 2000, DEBUG);
+  sendAT("AT+HTTPPARA=\"CONTENT\",\"application/x-www-form-urlencoded\"", 1000, DEBUG);
+  sendAT("AT+HTTPACTION=0", 30000, DEBUG);
+  sendAT("AT+HTTPTERM", 3000, DEBUG);
 
   delay(15000);
 }
 
-String sendData(String command, const int timeout, boolean debug) {
+String sendAT(const String& command,
+              uint32_t timeout,
+            bool dbg){
   String response = "";
   Serial1.println(command);
   long int time = millis();
@@ -61,34 +65,85 @@ String sendData(String command, const int timeout, boolean debug) {
       response += c;
     }
   }
-  if (debug) {
+  if (DEBUG) {
     SerialUSB.print(response);
   }
   return response;
 }
 
-void ltePowerSequence(){
-  delay(100);
-  digitalWrite(LTE_RESET_PIN, HIGH);
-  delay(2000);
-  digitalWrite(LTE_RESET_PIN, LOW);
+void ltePowerSequence() {
+    if (DEBUG) SerialUSB.println(F(">> LTE Power Sequence Start"));
 
-  
-  delay(100);
-  digitalWrite(LTE_PWRKEY_PIN, HIGH);
-  delay(2000);
-  digitalWrite(LTE_PWRKEY_PIN, LOW);
+    // 1. Hard reset module
+    digitalWrite(LTE_RESET_PIN, HIGH);
+    delay(100); // assert reset
+    digitalWrite(LTE_RESET_PIN, LOW);
 
-  pinMode(LTE_FLIGHT_PIN, OUTPUT);
-  digitalWrite(LTE_FLIGHT_PIN, LOW); // Normal mode
+    // 2. Power on via PWRKEY toggle
+    digitalWrite(LTE_PWRKEY_PIN, HIGH);
+    delay(1500); // hold HIGH for power-on trigger
+    digitalWrite(LTE_PWRKEY_PIN, LOW);
 
-  delay(30000); // Wait for LTE module
+    // 3. Exit flight mode (enter normal mode)
+    digitalWrite(LTE_FLIGHT_PIN, LOW);
 
-  // LTE network setup
-  sendData("AT+CCID", 3000, DEBUG);
-  sendData("AT+CREG?", 3000, DEBUG);
-  sendData("AT+CGATT=1", 1000, DEBUG);
-  sendData("AT+CGACT=1,1", 1000, DEBUG);
-  sendData("AT+CGDCONT=1,\"IP\",\"fast.t-mobile.com\"", 1000, DEBUG);
-  sendData("AT+CGPADDR=1", 3000, DEBUG);          // show pdp address
+    // 4. Wait and check for modem readiness
+    delay(2000);
+    unsigned long start = millis();
+    while (millis() - start < 30000) {  // 30 seconds max wait
+        String resp = sendAT("AT", 1000, false);
+        if (resp.indexOf("OK") != -1) break;
+        delay(1000);
+        if (DEBUG) SerialUSB.println(F("Waiting for modem..."));
+    }
+
+    // 5. SIM check
+    String simStatus = sendAT("AT+CPIN?", 2000);
+    if (simStatus.indexOf("READY") == -1) {
+        SerialUSB.println(F("SIM not ready - aborting setup."));
+        return;
+    }
+
+    // 6. Get SIM CCID
+    sendAT("AT+CCID", 2000);
+
+    // 7. Network registration
+    sendAT("AT+CREG=1", 1000);  // enable unsolicited network status
+    for (int i = 0; i < 10; i++) {
+        String reg = sendAT("AT+CREG?", 2000);
+        if (reg.indexOf(",1") != -1 || reg.indexOf(",5") != -1) break;  // home/roaming
+        delay(2000);
+        if (DEBUG) SerialUSB.println(F("Waiting for network registration..."));
+    }
+
+    // 8. Attach to packet domain
+    sendAT("AT+CGATT=1", 2000);
+
+    // 9. Define PDP context (APN first!)
+    sendAT("AT+CGDCONT=1,\"IP\",\"fast.t-mobile.com\"", 2000);
+
+    // 10. Activate PDP context
+    sendAT("AT+CGACT=1,1", 2000);
+
+    // 11. Verify the PDP address (get IP)
+    sendAT("AT+CGPADDR=1", 3000);
+
+    // 12. Enable time synchronization from network
+    enableTimeUpdates();
+
+    if (DEBUG) SerialUSB.println(F("<< LTE Power Sequence Complete"));
+}
+
+void enableTimeUpdates(){
+  String r = sendAT("AT+CTZU=1");
+}
+
+String getTime(){
+  String time = sendAT("AT+CCLK?");
+  int q_index = time.indexOf("\"");
+  time = time.substring(q_index + 1, q_index + 21);
+
+  if (DEBUG) SerialUSB.println("getTime() response:"+time);
+
+  return time;
 }
