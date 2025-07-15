@@ -49,6 +49,7 @@ void   uploadData();
 void   receiveEvent(int numBytes);
 void enableTimeUpdates();
 String getTime();
+String getCoords();
 /* ------------------------------------------------------------------- */
 
 void setup() {
@@ -209,15 +210,20 @@ void uploadData() {
 
   String date = yr + "-" + mon + "-" + day;
   String time = hr + ":" + min + ":" + sec;
+  
+  /* Get GPS info */
+  String coords = getCoords();
+  coords.replace("\n", "");
 
   /* ---- Build ThingSpeak URL -------------------------------------- */
   String url = "http://api.thingspeak.com/update?api_key="+(String)API_WRITE_KEY;
   url += "&field1=" + date;
   url += "&field2=" + time;
-  url += "&field3=0.000000,0.000000,0.0";
+  url += "&field3=" + coords;
   url += "&field4=" + tempVal;
   url += "&field5=" + moistVal;
   url += "&field6=0.0,0.0";
+
 
   SerialUSB.println("\n[HTTP] » " + url);
 
@@ -276,4 +282,56 @@ String getTime(){
 	if (DEBUG) SerialUSB.println("getTime() response:"+time);
 
 	return time;
+}
+
+String getCoords(){
+  sendAT("AT+CGPS=1,1");                   // Start GNSS in standalone mode
+  delay(1000);                             // Allow GNSS to initialize
+
+  String resp = sendAT("AT+CGPSINFO");
+  sendAT("AT+CGPS=0");                     // Turn GNSS off after use
+  
+  int colon = resp.indexOf(':');
+  if (colon < 0) {
+    SerialUSB.println(F("Malformed CGPSINFO"));
+    return "0.0,0.0,0";
+  }
+
+  String payload = resp.substring(colon + 1);
+  payload.trim();
+
+  if (payload.indexOf(",,") >= 0) {
+    SerialUSB.println(F("No GPS fix"));
+    return "0.0,0.0,0";
+  }
+
+  // Extract fields: lat, N/S, lon, E/W, date, time, alt
+  char latStr[16], ns, lonStr[16], ew;
+  char date[7], time[10];
+  float alt;
+
+  int parsed = sscanf(payload.c_str(), "%15[^,],%c,%15[^,],%c,%6s,%9s,%f",
+                      latStr, &ns, lonStr, &ew, date, time, &alt);
+  if (parsed < 7) {
+    SerialUSB.println(F("Failed to parse CGPSINFO fields"));
+    return "0.0,0.0,0";
+  }
+
+  // ---- Convert to decimal degrees ----
+  float latDeg = atof(latStr);
+  float lonDeg = atof(lonStr);
+
+  float lat_dd = int(latDeg / 100);
+  float lat_mm = latDeg - lat_dd * 100;
+  float latitude = lat_dd + lat_mm / 60.0;
+  if (ns == 'S') latitude *= -1;
+
+  float lon_dd = int(lonDeg / 100);
+  float lon_mm = lonDeg - lon_dd * 100;
+  float longitude = lon_dd + lon_mm / 60.0;
+  if (ew == 'W') longitude *= -1;
+
+  String coords = (String) longitude + "," + (String)latitude + "," + (String)alt;
+
+  return coords;
 }
