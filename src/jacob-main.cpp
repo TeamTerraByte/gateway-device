@@ -23,6 +23,7 @@ String moistBuf = "";
 String tempBuf  = "";
 String curType  = "";
 bool   assembling = false;          // true while a block is still arriving
+bool   processingData = false;      // true while sampleData() is running
 
 
 /* --- CONSTANTS --- */
@@ -63,6 +64,11 @@ bool sdDeleteCsv(const char* name);
 void processChunk(const String& data);
 void sampleData();
 String tsvToFieldString(const String &tsvLine);
+void initGPS();
+String getGPSData();
+String parseCoordinates(const String& nmeaLine);
+String getIRTemperatureData();
+void clearAllCsvFiles();
 
 
 /* ======================================================== */
@@ -99,6 +105,11 @@ void setup(){
         processChunk(chunk);               // assemble
     });
 
+    /* --- INITIALIZE LTE AND GPS --- */
+    ltePowerSequence();
+    delay(2000);  // Wait for LTE module to stabilize
+    initGPS();
+
     state = 0;
     SerialUSB.println("Setup complete!");
 }
@@ -110,29 +121,36 @@ void loop(){
     switch(state) {
         /* --- GATEWAY AND TRANSMIT --- */
         case 0:
-            if (DEBUG) SerialUSB.println("State 0");
+            if (DEBUG) SerialUSB.println("State 0 - Data Collection and Upload");
 
             /* --- Upload Data via HTTPS --- */
             if (sdHasCsvFiles()) {
                 SerialUSB.println(F("Uploading saved data..."));
                 if (sdUploadChrono()) {
                     SerialUSB.println(F("Data upload successful."));
-                    sdDeleteCsv("data.csv"); // needs to be modified to delete all files
+                    // Clear all old CSV files after successful upload
+                    clearAllCsvFiles();
                 }
                 else {
                     SerialUSB.println("Data upload unsuccessful");
                 }
             }
+            
             delay(1000); // Allow time for the sensor to power up
-            /* --- Sample Data from Sensors --- */
-            sampleData();
+            
+                    /* --- Sample Data from Sensors --- */
+        sampleData();
 
-            hoursInDay = 0;
-            state = 1;
+        // Ensure processing flag is reset even if sampleData() fails
+        processingData = false;
+        
+        hoursInDay = 0;
+        state = 1;
             break;
+            
         /* --- WAITING MODE --- */
         case 1:
-            if (DEBUG) SerialUSB.println("State 1");
+            if (DEBUG) SerialUSB.println("State 1 - Waiting Mode");
             
             if ( hoursInDay < 1 ) {
                 delay(15000); // simulate 15 seconds of Low power mode
@@ -145,11 +163,13 @@ void loop(){
                 break;
             }
             break;
+            
         /* --- COLLECTION MODE --- */
         case 2:
-            // if (DEBUG) SerialUSB.println("State 2");
+            if (DEBUG) SerialUSB.println("State 2 - Collection Mode");
             state = 1; // Return to low power mode
             break;
+            
         default:
             SerialUSB.println(F("Invalid state!"));
             state = 0;
@@ -161,32 +181,69 @@ void loop(){
 /* ======================================================== */
 /* |--------------- FUNCTION DEFINITIONS -----------------| */
 /* ======================================================== */
-void ltePowerSequence(){
-    if (DEBUG) SerialUSB.println("Initiating ltePowerSequence");
-    
+void ltePowerSequence() {
+    if (DEBUG) SerialUSB.println(F(">> LTE Power Sequence Start"));
+
+    // 1. Hard reset module
     digitalWrite(LTE_RESET_PIN, HIGH);
-    delay(2000);
+    delay(100); // assert reset
     digitalWrite(LTE_RESET_PIN, LOW);
 
-    
-    delay(100);
+    // 2. Power on via PWRKEY toggle
     digitalWrite(LTE_PWRKEY_PIN, HIGH);
-    delay(2000);
+    delay(1500); // hold HIGH for power-on trigger
     digitalWrite(LTE_PWRKEY_PIN, LOW);
 
-    digitalWrite(LTE_FLIGHT_PIN, LOW); // Normal mode
+    // 3. Exit flight mode (enter normal mode)
+    digitalWrite(LTE_FLIGHT_PIN, LOW);
 
-    delay(30000); // Wait for LTE module
+    // 4. Wait and check for modem readiness
+    delay(2000);
+    unsigned long start = millis();
+    while (millis() - start < 30000) {  // 30 seconds max wait
+        String resp = sendAT("AT", 1000, false);
+        if (resp.indexOf("OK") != -1) break;
+        delay(1000);
+        if (DEBUG) SerialUSB.println(F("Waiting for modem..."));
+    }
 
-    // LTE network setup
-    sendAT("AT+CCID", 3000);
-    sendAT("AT+CREG?", 3000);
-    sendAT("AT+CGATT=1", 1000);
-    sendAT("AT+CGACT=1,1", 1000);
-    sendAT("AT+CGDCONT=1,\"IP\",\"fast.t-mobile.com\"", 1000);
-    sendAT("AT+CGPADDR=1", 3000);          // show pdp address
+    // 5. SIM check
+    String simStatus = sendAT("AT+CPIN?", 2000);
+    if (simStatus.indexOf("READY") == -1) {
+        SerialUSB.println(F("SIM not ready - aborting setup."));
+        return;
+    }
+
+    // 6. Get SIM CCID
+    sendAT("AT+CCID", 2000);
+
+    // 7. Network registration
+    sendAT("AT+CREG=1", 1000);  // enable unsolicited network status
+    for (int i = 0; i < 10; i++) {
+        String reg = sendAT("AT+CREG?", 2000);
+        if (reg.indexOf(",1") != -1 || reg.indexOf(",5") != -1) break;  // home/roaming
+        delay(2000);
+        if (DEBUG) SerialUSB.println(F("Waiting for network registration..."));
+    }
+
+    // 8. Attach to packet domain
+    sendAT("AT+CGATT=1", 2000);
+
+    // 9. Define PDP context (APN first!)
+    sendAT("AT+CGDCONT=1,\"IP\",\"fast.t-mobile.com\"", 2000);
+
+    // 10. Activate PDP context
+    sendAT("AT+CGACT=1,1", 2000);
+
+    // 11. Verify the PDP address (get IP)
+    sendAT("AT+CGPADDR=1", 3000);
+
+    // 12. Enable time synchronization from network
     enableTimeUpdates();
+
+    if (DEBUG) SerialUSB.println(F("<< LTE Power Sequence Complete"));
 }
+
 
 void modemOff() {
     sendAT("AT+CPOF", 1000, false);  // turn off modem
@@ -229,10 +286,16 @@ String tsvToFieldString(const String &tsvLine)
     int end = tsvLine.indexOf('\t', start);    // next TAB
     if (end == -1) end = tsvLine.length();     // last value
 
+    String fieldValue = tsvLine.substring(start, end);
+    
+    // URL encode the field value
+    fieldValue.replace("+", "%2B");  // Encode plus signs
+    fieldValue.replace(" ", "%20");  // Encode spaces
+    
     out += "field";
     out += fieldNo++;
     out += '=';
-    out += tsvLine.substring(start, end);
+    out += fieldValue;
 
     if (end < tsvLine.length()) out += '&';    // no '&' after last field
     start = end + 1;                           // jump past TAB
@@ -242,6 +305,13 @@ String tsvToFieldString(const String &tsvLine)
 
 bool uploadData(const String& payload) {
     if (DEBUG) SerialUSB.println("uploadData payload: " + payload);
+    
+    // Check for invalid data that would cause HTTP 400
+    if (payload.indexOf("No IR") != -1 || payload.indexOf("25-07-10") != -1) {
+        SerialUSB.println("Skipping invalid data payload");
+        return false;
+    }
+    
 	bool success = false;
 
 	// For some reason, I have only observed consistent success using HTTP
@@ -359,9 +429,127 @@ bool sdDeleteCsv(const char* name) {
     return SD.exists(name) && SD.remove(name);
 }
 
+void clearAllCsvFiles() {
+    if (!sdInit()) return;
+    
+    File dir = SD.open("/");
+    while (File f = dir.openNextFile()) {
+        if (!f.isDirectory() && String(f.name()).endsWith(".CSV")) {
+            f.close();
+            SD.remove(f.name());
+            if (DEBUG) SerialUSB.println("Deleted old file: " + String(f.name()));
+        } else {
+            f.close();
+        }
+    }
+    dir.close();
+}
+
+/* --- GPS FUNCTIONS --- */
+void initGPS() {
+    if (DEBUG) SerialUSB.println("Initializing GPS...");
+    
+    // Basic AT commands to set up GPS
+    sendAT("AT", 1000);              // Basic check
+    sendAT("ATE0", 1000);            // Disable echo
+    sendAT("AT+CGPS=1,1", 2000);     // Power on GPS in standalone mode
+    
+    if (DEBUG) SerialUSB.println("GPS initialization complete");
+}
+
+String getGPSData() {
+    String gpsInfo = sendAT("AT+CGPSINFO", 3000);
+    
+    if (gpsInfo.indexOf("+CGPSINFO:") >= 0) {
+        // Extract the GPS data line
+        int startIdx = gpsInfo.indexOf("+CGPSINFO:");
+        int endIdx = gpsInfo.indexOf('\n', startIdx);
+        if (endIdx == -1) endIdx = gpsInfo.length();
+        
+        String nmeaLine = gpsInfo.substring(startIdx, endIdx);
+        nmeaLine.trim();
+        
+        if (DEBUG) SerialUSB.println("GPS Raw: " + nmeaLine);
+        
+        return parseCoordinates(nmeaLine);
+    }
+    
+    return ""; // No GPS data available
+}
+
+String parseCoordinates(const String& nmeaLine) {
+    int idx = nmeaLine.indexOf(":");
+    if (idx < 0) return "";
+
+    String data = nmeaLine.substring(idx + 1);
+    data.trim();
+
+    // Data format: <lat>,<N/S>,<long>,<E/W>,<date>,<utc>,<alt>,<speed>
+    int firstComma = data.indexOf(',');
+    if (firstComma < 0 || data[firstComma + 1] == ',') return ""; // No GPS fix
+
+    String lat = data.substring(0, firstComma);
+    int secondComma = data.indexOf(',', firstComma + 1);
+    String ns = data.substring(firstComma + 1, secondComma);
+
+    int thirdComma = data.indexOf(',', secondComma + 1);
+    String lon = data.substring(secondComma + 1, thirdComma);
+    int fourthComma = data.indexOf(',', thirdComma + 1);
+    String ew = data.substring(thirdComma + 1, fourthComma);
+
+    // Get altitude (7th field)
+    int altStart = data.indexOf(',', fourthComma + 1);
+    for (int i = 0; i < 2; i++) { // Skip date and UTC
+        altStart = data.indexOf(',', altStart + 1);
+    }
+    int altEnd = data.indexOf(',', altStart + 1);
+    String alt = data.substring(altStart + 1, altEnd);
+
+    if (lat.length() == 0 || lon.length() == 0) return "";
+
+    // Convert to decimal degrees
+    float latDeg = lat.toFloat() / 100.0;
+    float lonDeg = lon.toFloat() / 100.0;
+    float altM = alt.toFloat();
+
+    // Apply hemisphere corrections
+    if (ns == "S") latDeg = -latDeg;
+    if (ew == "W") lonDeg = -lonDeg;
+
+    // Update global location struct
+    location.latitude = latDeg;
+    location.longitude = lonDeg;
+    location.altitude = altM;
+
+    return String(latDeg, 6) + "," + String(lonDeg, 6) + "," + String(altM, 1);
+}
+
+/* --- IR TEMPERATURE SENSOR FUNCTIONS --- */
+String getIRTemperatureData() {
+    // TODO: Implement IR temperature sensor reading
+    // This function should return air temperature and surface temperature
+    // Format: "air_temp,surface_temp" as string
+    
+    // Placeholder implementation - replace with actual sensor code
+    float airTemp = 25.0;      // Air temperature in Celsius
+    float surfaceTemp = 30.0;  // Surface temperature in Celsius
+    
+    if (DEBUG) {
+        SerialUSB.println("IR Sensor - Air: " + String(airTemp, 1) + "°C, Surface: " + String(surfaceTemp, 1) + "°C");
+    }
+    
+    return String(airTemp, 1) + "," + String(surfaceTemp, 1);
+}
+
 /* --- PROCESS I²C CHUNK FROM ENVIROPRO --- */
 void processChunk(const String& data)
 {
+    // Don't process new data if sampleData() is currently running
+    if (processingData) {
+        if (DEBUG) SerialUSB.println("Skipping chunk - data processing in progress");
+        return;
+    }
+    
     SerialUSB.println("Processing Chunk: " + data);
     /* 1 ── new transmission header ------------------------ */
     if (data.startsWith("Moist,")) {
@@ -386,6 +574,7 @@ void processChunk(const String& data)
          *        the end of this transmission ------------- */
         if (data.length() < 15) {
             assembling = false;      // finished – ready for sampleData()
+            if (DEBUG) SerialUSB.println("Data assembly complete");
             /*  let the state-machine call sampleData()
                 (case 2) to save the finished buffer        */
         }
@@ -398,19 +587,29 @@ void processChunk(const String& data)
 void sampleData()
 {   
     if (DEBUG) SerialUSB.println("Attempting to sample data");
+    
+    // Set processing flag to prevent new I2C data from interfering
+    processingData = true;
+    
     /* 1 ── still receiving an I²C block? */
     if (assembling) {
         if (DEBUG) SerialUSB.println("Sample cancelled, still assembling");
+        processingData = false;
         return;
     }
 
     /* 2 ── need BOTH buffers ready */
     if (!moistBuf.length() || !tempBuf.length()) {
         Serial.println("Sample cancelled, one buffer not ready");
+        processingData = false;
         return;
     }
 
-    /* 3 ── strip the labels (“Moist,” / “Temp,”) ------------- */
+    /* 3 ── strip the labels ("Moist," / "Temp,") ------------- */
+    if(DEBUG){  // code hung after attempting to sample data. New data came in and the state machine seemed to halt.
+        SerialUSB.println("moistBuf=" + moistBuf);
+        SerialUSB.println("tempBuf=" + tempBuf);
+    }
     String moistValues = moistBuf.substring(6);      // after "Moist,"
     String tempValues  = tempBuf.substring(5);       // after "Temp,"
     if (moistValues.endsWith(",")) moistValues.remove(moistValues.length() - 1);
@@ -418,7 +617,7 @@ void sampleData()
 
     /* 4 ── build timestamp ---------------------------------- */
     String time = getTime();
-    uint16_t yr = time.substring(0,2).toInt();
+    uint16_t yr2digit = time.substring(0,2).toInt();
     uint8_t  mon = time.substring(3,5).toInt();
     uint8_t  day = time.substring(6,8).toInt();
     uint8_t  hr = time.substring(9,11).toInt();
@@ -426,29 +625,40 @@ void sampleData()
     uint8_t  sec = time.substring(15,17).toInt();
 
     char dateStr[11], timeStr[9];
-    snprintf(dateStr, sizeof(dateStr), "%02u-%02u-%02u", yr, mon, day);
+    snprintf(dateStr, sizeof(dateStr), "%02u/%02u/%02u", yr2digit, mon, day);
     snprintf(timeStr, sizeof(timeStr), "%02u:%02u:%02u", hr, min, sec);
 
-    /* 5 ── compose CSV row ---------------------------------- */
+    /* 5 ── get GPS data ---------------------------------- */
+    String gpsData = getGPSData();
+    if (gpsData.length() == 0) {
+        // Use last known location or default values
+        gpsData = String(location.latitude, 6) + "," + String(location.longitude, 6) + "," + String(location.altitude, 1);
+        if (DEBUG) SerialUSB.println("Using cached GPS data: " + gpsData);
+    } else {
+        if (DEBUG) SerialUSB.println("Fresh GPS data: " + gpsData);
+    }
+
+    /* 6 ── get IR temperature data ---------------------------------- */
+    String irData = getIRTemperatureData();
+
+    /* 7 ── compose CSV row ---------------------------------- */
     String row  = String(dateStr) + "\t" + timeStr + "\t";
-    row += String(location.latitude , 6) + ",";
-    row += String(location.longitude, 6) + ",";
-    row += String(location.altitude , 1) + "\t";
-    row += tempValues + "\t" + moistValues + "\t0.0,0.0";   // placeholder for IR_Temp
+    row += gpsData + "\t";
+    row += tempValues + "\t" + moistValues + "\t" + irData;
     
     row.replace("\n", "");
     row.replace(" ", "%20");  // url encoding
 
 
-    /* 6 ── ensure SD present -------------------------------- */
+    /* 8 ── ensure SD present -------------------------------- */
     if (!sdInit()) {
         SerialUSB.println("Failed to initialize SD card");
         return;                          // silent if no card
     }
 
-    /* 7 ── open / create daily file ------------------------- */
+    /* 9 ── open / create daily file ------------------------- */
     char fname[24];
-    snprintf(fname, sizeof(fname), "D%02u%02u%02u.CSV", yr, mon, day);
+    snprintf(fname, sizeof(fname), "D%02u%02u%02u.CSV", yr2digit, mon, day);  // Use 2-digit year for filename
     bool newFile = !SD.exists(fname);
 
     File f = SD.open(fname, FILE_WRITE);
@@ -458,13 +668,14 @@ void sampleData()
         return;
     }
 
-    /* 9 ── append the data row ------------------------------ */
+    /* 10 ── append the data row ------------------------------ */
     if (DEBUG) SerialUSB.println("Writing row to SD: " + row);
     f.println(row);
     f.close();
 
-    /*10 ── clear for next hour ------------------------------ */
+    /* 11 ── clear for next hour ------------------------------ */
     moistBuf  = "";
     tempBuf   = "";
     curType   = "";
+    processingData = false;  // Allow new I2C data to be processed
 }
